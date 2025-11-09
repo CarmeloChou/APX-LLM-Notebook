@@ -95,5 +95,15 @@ expand = original.repeat_interleave(2, dim=0)
 # 替代repeat_interleave的更简洁写法
 k_expanded = k_small.repeat(1, self.group_size, 1, 1)  # 在维度1上重复group_size次
 v_expanded = v_small.repeat(1, self.group_size, 1, 1)
+
+# 也可以使用stack
+k = torch.stack([k, k], dim=1)
+k.fatten(1,2)
+
+# 还可以切片
+k_expand = torch.zeros_like(q)
+k_expand(:, 0::2, ...) = k
+k_expand(:, 1::2, ...) = k
+
 ```
 
