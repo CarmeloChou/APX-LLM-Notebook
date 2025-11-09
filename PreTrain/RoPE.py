@@ -18,9 +18,9 @@ class RoPE(nn.Module):
         angles = positions.unsqueeze(-1) * self.theta.unsqueeze(0)
         print(angles.shape)
 
-        cos_val = torch.cos(angles)
+        cos_val = torch.cos(angles).unsqueeze(0)
         print(cos_val.shape)
-        sin_val = torch.sin(angles)
+        sin_val = torch.sin(angles).unsqueeze(0)
         print(sin_val.shape)
 
         X_real = X[..., 0::2]
