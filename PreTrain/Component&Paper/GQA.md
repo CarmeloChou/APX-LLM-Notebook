@@ -97,8 +97,10 @@ k_expanded = k_small.repeat(1, self.group_size, 1, 1)  # 在维度1上重复grou
 v_expanded = v_small.repeat(1, self.group_size, 1, 1)
 
 # 也可以使用stack
+# stack 表示在指定维度上堆叠，如果原来维度为3， 4.在0维度上堆叠表示 2，3，4；在1维度上表示3，2，4；在2维度上表示3，4，2
 k = torch.stack([k, k], dim=1)
-k.fatten(1,2)
+# flatten 用法，从开始维度到终止维度展平，也可以直接使用-2，表示在倒数两个维度上展平
+k.flatten(1,2) 
 
 # 还可以切片
 k_expand = torch.zeros_like(q)
