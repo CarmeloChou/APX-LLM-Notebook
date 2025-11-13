@@ -179,6 +179,140 @@ class PrefixTunning(nn.Module):
 
 重参数化方法修改了权重更新的表示或应用方式，而不是直接添加参数或选择子集。此类中最突出的技术使用低秩近似。
 
-- **低秩适应 (LoRA)：** LoRA 基于这样的假设：适应所需的权重变化（ΔWΔ*W*）具有较低的“内在秩”。LoRA 不学习完整的 ΔWΔ*W* 矩阵，而是通过训练两个小得多的低秩矩阵 B*B* 和 A*A* 来近似它，使得 ΔW≈BAΔ*W*≈*B**A*。原始权重矩阵 W*W* 保持冻结，前向传播计算 h=(W+BA)x*h*=(*W*+*B**A*)*x*。训练期间，仅更新 B*B* 和 A*A*。这大幅度减少了可训练参数的数量，通常降至总数的不到0.1%。从数学上看，对于预训练权重矩阵 W0∈Rd×k*W*0∈R*d*×*k*，更新表示为： W=W0+ΔW=W0+BA*W*=*W*0+Δ*W*=*W*0+*B**A* 其中 B∈Rd×r*B*∈R*d*×*r*，A∈Rr×k*A*∈R*r*×*k*，且秩 r≪min⁡(d,k)*r*≪min(*d*,*k*)。
+论文：[低秩适应LoRA](./Paper/LoRA Low-Rank Adaptation of Large Language Models.pdf)
 
-LoRA 在参数效率和性能之间实现了很好的平衡。低秩更新矩阵 B*B* 和 A*A* 非常紧凑。重要的是，一旦训练完成，更新 BA*B**A* 可以合并回原始权重中（W=W0+BA*W*=*W*0+*B**A*），与原始模型相比，消除了任何推理延迟开销。这一特性对于部署场景尤其有吸引力。
+预训练模型已经包含了大量的通用知识，当针对特定任务进行微调时，如情感分析或者代码生成，我们没有从根本上改变原有通用模型对相关任务的理解。而是通过微调来使其现有的能力适应特定的任务和模式。这种引导和适配增量的过程，可以通过在**高维权重空间**沿着相对较少的方向或维度修改原始权重来表示。
+
+也就是说，通用模型是一个全才，但在特有的指示方向上并没有那么强势，这也就是其高维空间向量中数值表达较少的方向，这种理念又与SVD分解相似。通过分解得到低秩矩阵，减少学习参数。ΔW∈Rd×kΔ*W*∈R*d*×*k*
+$$
+W = W_0 + \Delta W \\
+$$
+
+$$
+\Delta W ≈ BA
+$$
+
+$$
+h = W_0x + \Delta W_0x = W_0x +BAx
+$$
+
+$$
+缩放因子： \alpha \space {对BA施加更新幅度，使用 \frac{\alpha}{r}进行缩放，有助于稳定训练} \\
+h = W_0x + \frac{\alpha}{r}BAx
+$$
+
+一般而言，使用随机高斯值初始化A，零初始化B。这是为了保证训练开始时BA为0，使得初始LoRA模型与原有预训练模型完全一致
+
+- 参数量：r * （d + k)   r << min(d, k)，数量远小于微调w_0的 d * k参数量。增加r也会增加内存需求量
+- 近似能力：r决定了BA矩阵秩的上限。更高的r允许BA近似更复杂的Δ*W* 。如果真实固有秩较高，r较小可能导致欠拟合。如果过高，可能通过捕捉噪声或虚假相关性导致数过拟合，并且增加计算成本。
+- 选取r的方法：
+  1. 测试，r=4，8，16等等值
+  2. 计算开销，资源有限需要权衡
+  3. 性能饱和，随着r的增加，会有临界值，达到之后性能会趋于平稳
+  4. 任务复杂度
+- 选取α。α过高更侧重LoRA的调整。加速适应目标任务，但可能产生对与训练阶段的遗忘；α较低，减小LoRA影响，更好的保留基础模型的能力，提高泛化能力
+  1. 设定α=r
+  2. 设定α为固定值，如16，32，64
+  3. 将α视为独立的超参数。使用网格搜索、随机搜索或者贝叶斯优化进行系统调整。
+
+LoRA层的实现：
+
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+
+class LoRALinear(nn.Module):
+    """
+    将标准 Linear 层替换为LoRA层
+    """
+    def __init__(self, original_layer, alpha, rank, lora_drop):
+        super().__init__()
+        self.in_features = original_layer.in_features
+        self.out_features = original_layer.out_features
+        self.original_layer = original_layer
+        self.alpha = alpha
+        self.rank = rank
+        self.lora_drop = lora_drop
+        
+        # 将原始权重和偏置注册为不可训练的参数
+        self.weight = nn.Parameter(original_layer.weight.detach().clone())
+        self.weight.requires_grad = False
+
+        if original_layer.bias is not None:
+            self.bias = nn.Parameter(original_layer.bias.detach().clone())
+            self.bias.requires_grad = False
+        else:
+            # 使用 register_parameter 确保 'bias' 属性存在，即使它为 None
+            self.register_parameter('bias', None)
+            
+        # 创建并初始化AB
+        self.lora_A = nn.Parameter(torch.Tensor(rank, self.in_features))
+        self.lora_B = nn.Parameter(torch.Tensor(self.out_features, rank))
+        
+        # LoRA 路径的可选 dropout 层
+        if lora_drop > 0.0:
+            self.lora_drop = nn.Dropout(p=lora_drop)
+        else:
+            self.lora_drop = nn.Identity() # 作为一个直通层
+        
+        # 缩放因子
+        if rank > 0:
+            self.scaling = self.alpha / self.rank
+        else:
+            self.scaling = 1.0 # 如果秩为 0，避免除以零
+
+        # 初始化 LoRA 参数
+        self.reset_lora_parameters()
+        
+	 def reset_lora_parameters(self):
+        """ 初始化 LoRA 矩阵 A 和 B。 """
+        if self.rank > 0:
+            # 使用 Kaiming uniform 初始化 A，以获得更好的梯度流动
+            nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+            # 将 B 初始化为零，以便初始适应项为零
+            nn.init.zeros_(self.lora_B)
+            
+	def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """ 执行修改后的前向传播。 """
+        # 计算原始（不变的）线性变换
+        # 使用 F.linear 可以避免在混合张量时出现设备放置问题
+        result = F.linear(x, self.weight, self.bias)
+
+        # 如果 rank > 0，计算 LoRA 调整
+        if self.rank > 0:
+            # 在 LoRA 矩阵之前对输入 x 应用 dropout
+            x_lora = self.lora_dropout(x)
+
+            # 计算 x @ A^T
+            # 输入 x_lora (N, d_in), 权重 lora_A (r, d_in) -> 输出 (N, r)
+            after_A = F.linear(x_lora, self.lora_A.T)
+
+            # 计算 (x @ A^T) @ B^T
+            # 输入 after_A (N, r), 权重 lora_B (d_out, r) -> 输出 (N, d_out)
+            lora_adjustment = F.linear(after_A, self.lora_B.T)
+
+            # 将缩放后的 LoRA 调整添加到原始结果中
+            result += lora_adjustment * self.scaling
+
+        return result
+    
+    def train(self, mode: bool = True):
+        """ 确保原始权重在训练期间保持不变。 """
+        super().train(mode)
+        # 在模式更改后显式设置 requires_grad 为 False
+        self.weight.requires_grad = False
+        if self.bias is not None:
+            self.bias.requires_grad = False
+        # 确保 LoRA 参数可训练（它们默认是可训练的）
+        # self.lora_A.requires_grad = True
+        # self.lora_B.requires_grad = True
+
+    def extra_repr(self) -> str:
+        """ 向模块表示添加 LoRA 特定信息。 """
+        return (f'in_features={self.in_features}, out_features={self.out_features}, '
+                f'rank={self.rank}, alpha={self.alpha}')
+```
+
+LoRA也可应用于卷积层或嵌入层，实际使用中主要应用在Linear层中，尤其是**注意力机制及前馈网络**
