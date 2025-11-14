@@ -316,3 +316,67 @@ class LoRALinear(nn.Module):
 ```
 
 LoRA也可应用于卷积层或嵌入层，实际使用中主要应用在Linear层中，尤其是**注意力机制及前馈网络**
+
+### LoRA在Transformer中的应用
+
+主要考虑LoRA在何处有效融合进Transformer架构。Trams former通常包含MHA以及FFN，这些依赖线性变换，是LoRA适应的主要目标。
+
+常见调整MHA以及FNN
+
+```python
+import torch
+import torch.nn as nn
+import math
+
+class LoRALinear(nn.Module):
+    def __init__(self, original_layer, rank, alpha):
+        """
+        original_layer : 原始线性层
+        rank ： 秩
+        alpha ： 缩放规模
+        """
+        super().__init__()
+        self.original_layer = original_layer
+        self.rank = rank
+        self.alpha = alpha
+
+        # 冻结原始参数
+        for p in original_layer.parameters():
+            p.requires_grad = False
+
+         # 创建LoRA矩阵A和B（作为Parameter，不是Linear层）
+        self.lora_A = nn.Parameter(torch.Tensor(rank, original_layer.in_features))   # (r, d_in)
+        self.lora_B = nn.Parameter(torch.Tensor(original_layer.out_features, rank))  # (d_out, r)
+
+        # 初始化lora，A采用kaiming均匀分布，B使用0初始化
+        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+        nn.init.zeros_(self.lora_B)
+    
+	def forward(self, X):
+        # 冻结参数传播结果
+        result = self.original_layer(X)
+        
+        if self.rank > 0:
+        # 更高效的计算：x -> A -> B，避免大矩阵
+        lora_result = (x @ self.lora_A.t()) @ self.lora_B.t()  # x @ A^T @ B^T
+        result += lora_result * (self.alpha / self.rank)
+        
+        return result
+
+original_layer = nn.Linear(in_features=512, out_features=512)
+lora_layer = LoRALinear(original_layer, rank=8, alpha=16)
+```
+
+---
+
+补充：
+
+```python
+# nn.Linear 和 nn.Parameters的区别
+# nn.Parameter是一个可训练的张量
+self.lora_A = nn.parameter(torch.Tensor(rank, in_features))
+
+# nn.Linear是完整的神经网络层
+nn.Linear(rank, in_features)包含了weight和bias
+```
+
