@@ -11,7 +11,10 @@ DeepSeekMoE架构：设立n个专家，激活其中的k个；设立共享专家�
 - 稀疏MoE层：代替了传统Transformer中的FFN层。MoE层包含若干专家，每个专家本身是独立的神经网络，这些专家通常是FFN，也可以是更复杂的网络结构。甚至可以是MoE堆叠，形成层级MoE架构
 - 门控网络/路由：决定Token被发送到哪个专家。可分为Token Choice和Expert Choice，分别控制不同token分给不同的专家，或者全部token分给某个专家。Token choice可能存在语义中断的问题，某些token被集中分配到某些expert上，未分配的expert训练不充分，失去了MoE的意义。Expert Choice性能弱于Token Choice，expert choice会有单词丢失问题，可能会影响单词推理时无法看到后续的token
 
+## Token Choice
+
 ```python
+# Token Choice
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -51,7 +54,7 @@ class BasicMoELayer(nn.Module):
             original_shape = X.shape
             
             # 展平B T维度
-            X_flat = X.view(-1, n_embd)
+            X_flat = X.view(-1, n_embd) # B*T C
             
             # 计算门控分数
             gate_logits = self.gate(X_flat)
@@ -64,14 +67,14 @@ class BasicMoELayer(nn.Module):
             output = torch.zeros_like(X_flat)
             
             for expert_idx in range(self.num_experts):
-                expert_mask = (top_k_indices == expert_idx).any(dim=-1) #B, top_k
+                expert_mask = (top_k_indices == expert_idx).any(dim=-1) #B, 1
                 
                 if expert_mask.any():
-                    expert_input = X_flat[expert_mask] #B, top_k=True， n_embd
-                    expert_output = self.experts[expert_idx](expert_input) # B, top_k=True, n_embd
+                    expert_input = X_flat[expert_mask] #top_k=True, nembd
+                    expert_output = self.experts[expert_idx](expert_input) # top_k=True, n_embd
                     
-                    token_expert_mask = top_k_indices[expert_mask] == expert_idx # B, top_k
-                    token_wei = gate_wei[expert_mask] # B, top_k
+                    token_expert_mask = top_k_indices[expert_mask] == expert_idx # top_k=True, top_k
+                    token_wei = gate_wei[expert_mask] # B*T, top_k
                     
                     expert_wei = torch.sum(token_wei * token_expert_mask.float(), dim=-1, keepdim=True)
                     
@@ -90,4 +93,22 @@ a[[1,0,0]], a[[True, False, False]]
 # 以上二者结果不同，整数数组索引表示取第1行、第0行、第0行
 # 布尔掩码表示，只保留行数=True的那一行或多行
 ```
+
+## Expert Choice
+
+## Global Choice
+
+## Shared Experts
+
+# 优化策略
+
+## Load Balance 负载均衡
+
+指部分专家之间的分配计算不平衡，可能某些专家处于高负荷计算，但某些专家长期处于饥饿状态。可能影响模型的计算能力。
+
+## 辅助损失函数
+
+## 路由优化
+
+## 处理丢弃令牌
 
