@@ -62,12 +62,12 @@ class BasicMoELayer(nn.Module):
             # 选择top_k个专家
             top_k_gate, top_k_indices = torch.topk(gate_logits, k=self.top_k, dim=-1) 
             
-            gate_wei = F.softmax(top_k_gate, dim=-1)
+            gate_wei = F.softmax(top_k_gate, dim=-1) # B*T 2
             
             output = torch.zeros_like(X_flat)
             
             for expert_idx in range(self.num_experts):
-                expert_mask = (top_k_indices == expert_idx).any(dim=-1) #B, 1
+                expert_mask = (top_k_indices == expert_idx).any(dim=-1) #B*T, 1
                 
                 if expert_mask.any():
                     expert_input = X_flat[expert_mask] #top_k=True, nembd
@@ -95,6 +95,74 @@ a[[1,0,0]], a[[True, False, False]]
 ```
 
 ## Expert Choice
+
+```python
+class Expert_Choice_Efficient(nn.Module):
+    def __init__(self, n_embd, experts_num, expert_dim, top_k=2):
+        super().__init__()
+        self.n_embd = n_embd
+        self.experts_num = experts_num
+        self.expert_dim = expert_dim
+        self.top_k = top_k
+
+        # 共享的门控网络，输出为专家数量
+        self.gate_network = nn.Linear(n_embd, experts_num)
+
+        # 专家网络
+        self.experts = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(n_embd, expert_dim),
+                nn.GELU(),
+                nn.Linear(expert_dim, n_embd)
+            ) for _ in range(experts_num)
+        ])
+
+    def forward(self, X):
+        B, T, C = X.shape
+        x_flat = X.view(-1, C)  # [B*T, C]
+        total_tokens = x_flat.shape[0]
+
+        # 计算所有token对所有专家的分数
+        gate_scores = self.gate_network(x_flat)  # [B*T, experts_num]
+
+        # 每个专家选择top_k个token
+        top_k = min(self.top_k, total_tokens)
+        expert_topk_scores, expert_topk_indices = torch.topk(
+            gate_scores.t(), k=top_k, dim=1
+        )  # [experts_num, top_k]
+
+        # 初始化输出和usage统计
+        output = torch.zeros_like(x_flat)
+        usage_mask = torch.zeros(total_tokens, dtype=torch.bool, device=x_flat.device)
+
+        # 批量处理所有专家
+        for expert_id in range(self.experts_num):
+            token_indices = expert_topk_indices[expert_id]  # [top_k]
+            token_scores = expert_topk_scores[expert_id]  # [top_k]
+            
+            if len(token_indices) > 0:
+                # 标记被使用的token
+                usage_mask[token_indices] = True
+                
+                # 专家处理
+                selected_tokens = x_flat[token_indices]
+                expert_output = self.experts[expert_id](selected_tokens)
+                
+                # 计算权重
+                weights = F.softmax(token_scores, dim=0).unsqueeze(-1)
+                weighted_output = expert_output * weights
+                
+                # 使用index_add_高效累加
+                output.index_add_(0, token_indices, weighted_output)
+
+        # 处理未被选中的token（残差连接）
+        if (~usage_mask).any():
+            output[~usage_mask] = x_flat[~usage_mask]
+
+        return output.view(B, T, C)
+```
+
+token choice 不会造成语义中断，因为相邻的token更倾向于选择同一个expert。而expert choice则可能造成语义中断，相邻的token可能选择不同的expert
 
 ## Global Choice
 
