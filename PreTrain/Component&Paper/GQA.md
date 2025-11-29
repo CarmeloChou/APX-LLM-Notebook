@@ -45,8 +45,8 @@ class GQA(nn.Module):
         k = self.k_proj(X)
         v = self.v_proj(X)
         
-        q = q.view(B, T, n_head, self.head_dim).transpose(1, 2)
-        k = k.view(B, T, self.gqa_head, self.head_dim).transpose(1, 2)
+        q = q.view(B, T, n_head, self.head_dim).transpose(1, 2) # B, n_head, T, head_dim
+        k = k.view(B, T, self.gqa_head, self.head_dim).transpose(1, 2) # B, gqa_head, T, head_dim
         v = v.view(B, T, self.gqa_head, self.head_dim).transpose(1, 2)
         
         # 关键：将K、V广播到与Q相同的头数
@@ -54,7 +54,7 @@ class GQA(nn.Module):
         k = k.repeat_interleave(self.group_size, dim=1)  # [B, gqa_head, T, head_dim] -> [B, n_head, T, head_dim]
         v = v.repeat_interleave(self.group_size, dim=1)
         
-        score = F.softmax(q @ k^T / torch.sqrt(n_embd//n_head)) @ V
+        score = F.softmax(q @ k.tanspose(-1, -2) / torch.sqrt(n_embd//n_head)) @ V
         score = score.transpose(1, 2).contiguous().view(B, T, C)
         score = self.mlp(score)
         
