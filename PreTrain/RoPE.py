@@ -13,6 +13,7 @@ class RoPE(nn.Module):
         
         self.register_buffer('theta', theta)
 
+
     def forward(self, X):
         positions = torch.arange(0, X.size(1))
         angles = positions.unsqueeze(-1) * self.theta.unsqueeze(0)
