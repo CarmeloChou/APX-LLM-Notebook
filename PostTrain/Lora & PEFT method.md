@@ -182,7 +182,14 @@ class PrefixTunning(nn.Module):
 
 ## LORA简介
 
-论文：[低秩适应LoRA](./Paper/LoRA Low-Rank Adaptation of Large Language Models.pdf)
+论文：[低秩适应LoRA](./Papers/LoRA Low-Rank Adaptation of Large Language Models.pdf)
+
+![](E:\DATA\LLM\APX-LLM-Notebook\PostTrain\Image\LoRA.png)
+
+- A、B矩阵有一个初始化为0，有一个为高斯初始化，确保在第一次前向传播时，LoRA是无效的，有助于避免A、B均是随机初始化导致开始训练与原始模型有较大偏差。
+- 1/r : 当数据经过低秩矩阵B，送入激活函数之前，会出现与1/r的线性相关的波动，可以使用1/r缩放因子来抵消数据波动；r还可以看作平衡参数，控制A、B的类别，r较大时，A、B看作全面但存在冗余信息，r较小时看作精炼但不全面信息。
+- α：在训练LoRA时，α可看作模型对新知识的侧重程度
+- 论文中，LoRA只应用于W~q~和W~v~。
 
 预训练模型已经包含了大量的通用知识，当针对特定任务进行微调时，如情感分析或者代码生成，我们没有从根本上改变原有通用模型对相关任务的理解。而是通过微调来使其现有的能力适应特定的任务和模式。这种引导和适配增量的过程，可以通过在**高维权重空间**沿着相对较少的方向或维度修改原始权重来表示。
 
@@ -230,14 +237,14 @@ class LoRALinear(nn.Module):
     """
     将标准 Linear 层替换为LoRA层
     """
-    def __init__(self, original_layer, alpha, rank, lora_drop):
+    def __init__(self, original_layer, alpha, rank, lora_drop_rate):
         super().__init__()
         self.in_features = original_layer.in_features
         self.out_features = original_layer.out_features
         self.original_layer = original_layer
         self.alpha = alpha
         self.rank = rank
-        self.lora_drop = lora_drop
+        self.lora_drop_rate = lora_drop_rate
         
         # 将原始权重和偏置注册为不可训练的参数
         self.weight = nn.Parameter(original_layer.weight.detach().clone())
@@ -255,8 +262,8 @@ class LoRALinear(nn.Module):
         self.lora_B = nn.Parameter(torch.Tensor(self.out_features, rank))
         
         # LoRA 路径的可选 dropout 层
-        if lora_drop > 0.0:
-            self.lora_drop = nn.Dropout(p=lora_drop)
+        if lora_drop_rate > 0.0:
+            self.lora_drop = nn.Dropout(p=lora_drop_rate)
         else:
             self.lora_drop = nn.Identity() # 作为一个直通层
         
@@ -281,7 +288,7 @@ class LoRALinear(nn.Module):
         """ 执行修改后的前向传播。 """
         # 计算原始（不变的）线性变换
         # 使用 F.linear 可以避免在混合张量时出现设备放置问题
-        result = F.linear(x, self.weight, self.bias)
+        result = F.Linear(x, self.weight, self.bias)
 
         # 如果 rank > 0，计算 LoRA 调整
         if self.rank > 0:
@@ -290,11 +297,11 @@ class LoRALinear(nn.Module):
 
             # 计算 x @ A^T
             # 输入 x_lora (N, d_in), 权重 lora_A (r, d_in) -> 输出 (N, r)
-            after_A = F.linear(x_lora, self.lora_A.T)
+            after_A = F.Linear(x_lora, self.lora_A.T)
 
             # 计算 (x @ A^T) @ B^T
             # 输入 after_A (N, r), 权重 lora_B (d_out, r) -> 输出 (N, d_out)
-            lora_adjustment = F.linear(after_A, self.lora_B.T)
+            lora_adjustment = F.Linear(after_A, self.lora_B.T)
 
             # 将缩放后的 LoRA 调整添加到原始结果中
             result += lora_adjustment * self.scaling
@@ -303,6 +310,7 @@ class LoRALinear(nn.Module):
     
     def train(self, mode: bool = True):
         """ 确保原始权重在训练期间保持不变。 """
+        # 防御性重写父类中的train，确保self.weight不需要计算梯度
         super().train(mode)
         # 在模式更改后显式设置 requires_grad 为 False
         self.weight.requires_grad = False
@@ -413,9 +421,9 @@ class BasicPromptTuning:
         return combined_embeddings
 ```
 
-#### 初始化的影响
+#### 提示词初始化的影响
 
-提示词嵌入Pj*P**j*的初始化方式可以明显影响训练稳定性和最终性能。常用策略有：
+提示词嵌入P~j~的初始化方式可以明显影响训练稳定性和最终性能。常用策略有：
 
 1. **随机初始化：** 使用小的随机值初始化向量，类似于其他网络权重的初始化方式。这种方法简单，但可能需要仔细调整学习率，并可能导致更长的收敛时间。
 2. **词汇初始化：** 使用模型词汇表中与目标任务相关的特定词汇的平均嵌入来初始化提示词嵌入。例如，对于摘要任务，你可以使用“Summarize”、“TLDR”、“Abstract”、“Condense”等词汇的嵌入进行初始化。这可以为优化过程提供一个更好的起点。
@@ -452,3 +460,79 @@ P-Tuning v2（常被称为深度提示词微调）通过将可训练的提示词
 | **Prefix-Tuning**     | **Prefix-Tuning**          | **否**                     | **是**                       | 与P-Tuning类似，但不是只在输入加前缀，而是在模型的**每一层**（而不仅仅是输入层）都添加一组可训练的“前缀向量”。这些向量作为上下文，引导模型生成期望的输出。 |
 | **Adapter Tuning**    | **Adapter Tuning**         | **否**                     | **是**                       | 在Transformer的每个模块（如FFN层）内部插入一个小的、拥有瓶颈结构的**前馈神经网络**（Adapter）。只训练这些Adapter，冻结模型主体。 |
 | **LoRA**              | **Low-Rank Adaptation**    | **否**                     | **是**                       | 认为模型在微调过程中的参数更新量（ΔW）是**低秩**的。通过用两个小矩阵（A和B）的乘积来近似这个更新量 ΔW = A * B。训练时只训练A和B，然后将 ΔW 加到冻结的原始参数W上。 |
+
+# 进阶LoRA实现方法
+
+在之前建立的低秩适配（LoRA）基础理解之上，本章着重介绍高级实现方法和变体，以提高其性能、效率和适用性。我们将考察超出基础LoRA设置的技术，以应对实际LLM微调场景中遇到的具体问题。
+
+## B、A初始化策略
+
+### 默认初始化：B为零，A为高斯分布
+
+最广泛采用且通常为默认的LoRA初始化策略是：
+
+1. **初始化矩阵A\*A\*** 使用标准随机初始化方法，通常是Kaiming均匀或高斯分布（N(0,σ2)N(0,*σ*2)），且方差较小。这能确保投影到低秩空间的初始表示具有一定的变动性。
+2. **初始化矩阵B\*B\*** 为全零。
+
+**优点：**
+
+- **稳定性：** 从ΔW=0Δ*W*=0开始能避免对预训练模型精心学习到的表示造成任何初始干扰。这通常会带来更稳定的训练动态，尤其是在初始阶段。
+- **保留预训练知识：** 确保微调过程完全从基础模型的状态开始，没有来自LoRA层的任何初始随机扰动。
+
+**缺点：**
+
+- **初始学习可能较慢：** 由于B*B*从零开始，梯度信息需要回流以将B*B*更新为非零值，然后才能发生有意义的自适应。这可能会使收敛的初始阶段略微慢于ΔWΔ*W*从一开始就非零的方法。
+
+这种策略在流行的库中默认实施，例如Hugging Face的PEFT (`peft`)。例如，`LoraLayer`通常将`lora_B`权重初始化为零，并使用Kaiming均匀初始化来初始化`lora_A`权重。
+
+### 默认初始化：B为零，A为高斯分布
+
+另一种方法是使用随机分布初始化矩阵A*A*和B*B*，通常是精心选择（通常较小）方差σ2*σ*2的高斯分布（N(0,σ2)N(0,*σ*2)）。
+
+在这种情况下，当t=0*t*=0时，自适应项ΔW=BAΔ*W*=*B**A*将是一个非零矩阵，尽管如果σ*σ*较小，其项的值也可能较小。
+
+**原理：**
+
+这里的想法是，从小的非零随机自适应开始，可能让模型更快地学习到所需的调整，从而可能加速收敛。初始的随机ΔWΔ*W*提供了一个即时但可能带噪声的自适应方向。
+
+**注意事项：**
+
+- **方差选择（σ^2^）：** 这是一个重要的超参数。如果σ*σ*过大，初始的随机ΔW可能会显著干扰预训练权重W0，导致训练不稳定或立即性能下降。如果σ*σ*过小，其作用可能微不足道，并类似于将B*B*初始化为零。最佳方差通常需要调优。
+- **与学习率的相互作用：** 与将B*B*零初始化策略相比，非零的初始ΔW可能需要更小的初始学习率以保持稳定性。
+
+**优点：**
+
+- **潜在的更快初始收敛：** 模型不需要“打破B=0的对称性”，并且如果随机初始化提供有用信号，则可能在初始步骤中更快地自适应。
+
+**缺点：**
+
+- **不稳定性风险：** 如果未适当缩放，初始随机ΔW可能会干扰预训练模型的功能。
+- **对超参数的敏感性增加：** 需要更仔细地调优初始化方差（σ^2^）以及可能的学习率。
+
+## 训练后合并LoRA权重
+
+合并LoRA权重涉及计算有效权重更新 ΔW=αrBAΔ*W*=*r**α**B**A*，并将其直接添加到原始权重矩阵 W0*W*0。结果是一个新的权重矩阵 W~merged~，它包含了学到的适配：
+$$
+W_{merged}=W_0+ΔW=W_0+\frac{α}{r} BA
+$$
+计算完成后，W~merged~ 在模型层中替代原始权重矩阵 W0。使用这个特定合并模型进行推理时，不再需要独立的LoRA矩阵 A 和 B。该层随后像使用 W~merged~ 的标准层一样运行：
+$$
+h=W_{merged}x
+$$
+此计算在训练完成后离线进行。你为模型中每个经LoRA适配的层执行此计算。
+
+### 合并优点
+
+1. 部署简化，模型结构与原模型相同
+2. 潜在推理加速，算法路径减少，直接进行推理
+
+### 合并缺点
+
+1. 灵活性丧失，合并操作不可逆，一旦合并，失去了在同一模型基础上切换不同适配器的能力。
+2. 存储影响，lora适配器比基础模型小，存储大量小型适配器在存储效率上更显著。
+
+## 量化LoRA（QLoRA）原理
+
+虽然标准LoRA大幅减少了*可训练*参数的数量，但微调大型语言模型仍构成主要的内存难题。主要瓶颈通常不是适配器权重本身，而是加载庞大*基础模型*并进行计算所需的内存。即使模型被冻结，基础模型的权重（通常为FP16或BF16等16比特格式）也会占用大量GPU内存。此外，在前向和反向传播过程中计算的激活值会显著增加内存占用，这使得在没有高端多GPU配置的情况下，微调亿级参数模型通常不可行。
+
+QLoRA（量化低秩适配）直接解决了这个内存瓶颈。它引入了一种技术，通过大幅减少基础模型的内存占用，而不显著牺牲性能来微调大型语言模型。核心思想是将预训练的基础模型加载为极低精度（通常为4比特）的量化权重，同时以更高精度格式（如BFloat16）训练LoRA适配器。
