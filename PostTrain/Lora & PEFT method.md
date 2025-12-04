@@ -385,7 +385,7 @@ lora_layer = LoRALinear(original_layer, rank=8, alpha=16)
 ```python
 # nn.Linear 和 nn.Parameters的区别
 # nn.Parameter是一个可训练的张量
-self.lora_A = nn.parameter(torch.Tensor(rank, in_features))
+self.lora_A = nn.Parameter(torch.Tensor(rank, in_features))
 
 # nn.Linear是完整的神经网络层
 nn.Linear(rank, in_features)包含了weight和bias
@@ -672,3 +672,128 @@ QLoRA的核心是NF4数据类型。与标准整数或浮点数量化方案不同
 分页优化器的核心思想借鉴了计算机操作系统的**虚拟内存**或**分页机制**。当物理内存（RAM）不足时，操作系统会将暂时不用的数据从内存“换出”到硬盘上的“虚拟内存”空间，等需要时再“换入”内存。
 
 分页优化器做的事情与此完全类似，只不过是发生在**GPU显存**和**CPU内存**之间。
+
+## QLoRA实践——基于已有库
+
+```bash
+pip install -q transformers peft accelerate datasets bitsandbytes
+```
+
+### 加载量化模型
+
+```python
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+
+# 定义基础模型 ID（例如，Llama 或 Mistral 变体）
+model_id = "meta-llama/Llama-2-7b-hf" # 替换为您希望使用的模型
+
+# 配置 BitsAndBytes 量化
+bnb_config = BitsAndBytesConfig(
+    load_in_4bit=True,                     # 启用 4 比特加载
+    bnb_4bit_quant_type="nf4",             # 使用 NF4 量化
+    bnb_4bit_compute_dtype=torch.bfloat16, # 设置计算数据类型以提高效率
+    bnb_4bit_use_double_quant=True,        # 启用双重量化
+)
+
+# 使用指定的量化配置加载模型
+model = AutoModelForCausalLM.from_pretrained(
+    model_id,
+    quantization_config=bnb_config,
+    device_map="auto", # 自动将模型分发到可用的 GPU/CPU
+    # trust_remote_code=True # 某些模型需要
+)
+
+# 加载分词器
+tokenizer = AutoTokenizer.from_pretrained(model_id)
+# 确保为批量处理设置填充（padding）标记
+if tokenizer.pad_token is None:
+    tokenizer.pad_token = tokenizer.eos_token
+
+# 可选：训练时禁用缓存使用
+model.config.use_cache = False
+```
+
+### 配置 LoRA 适配器
+
+```python
+from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+
+# 为 k 比特训练准备模型（对 QLoRA 非常重要）
+model = prepare_model_for_kbit_training(model)
+
+# 定义 LoRA 配置
+lora_config = LoraConfig(
+    r=16,                            # 更新矩阵的秩
+    lora_alpha=32,                   # LoRA 缩放因子
+    target_modules=["q_proj", "v_proj"], # 将 LoRA 应用于查询和值投影
+    lora_dropout=0.05,               # LoRA 层的 Dropout 概率
+    bias="none",                     # 不训练偏置项
+    task_type="CAUSAL_LM",           # 指定任务类型
+)
+
+# 使用 LoRA 配置将基础模型与 PEFT 模型包装
+peft_model = get_peft_model(model, lora_config)
+
+# 打印可训练参数以验证
+peft_model.print_trainable_parameters()
+# 示例输出：trainable params: 4,194,304 || all params: 6,742,609,920 || trainable%: 0.0622
+```
+
+数据集准备
+
+```python
+rom datasets import load_dataset
+
+# 加载示例数据集（替换为您实际的数据集）
+data = load_dataset("Abirate/english_quotes") # 示例数据集
+data = data.map(lambda samples: tokenizer(samples["quote"]), batched=True)
+
+# 确保数据集已准备好进行训练（已分词，已格式化）
+# ... 在此处添加您的特定数据处理步骤 ...
+```
+
+配置训练器
+
+```python
+from transformers import TrainingArguments, Trainer
+
+# 定义训练参数
+training_args = TrainingArguments(
+    output_dir="./qlora-finetune-results", # 结果保存目录
+    per_device_train_batch_size=4,       # 每个 GPU 的批处理大小
+    gradient_accumulation_steps=4,       # 在 4 个步骤中累积梯度
+    learning_rate=2e-4,                  # 学习率
+    logging_steps=10,                    # 每 10 步记录一次日志
+    num_train_epochs=1,                  # 训练轮数
+    max_steps=-1,                        # 使用 num_train_epochs 而非 max_steps
+    save_steps=100,                      # 每 100 步保存检查点
+    fp16=False,                          # 禁用 fp16/混合精度（计算数据类型通过 bnb_config 为 bf16）
+    bf16=True,                           # 启用 bf16 精度（与 bnb_config 计算数据类型匹配）
+    optim="paged_adamw_8bit",            # 使用分页 AdamW 优化器以提高内存效率
+    # 其他参数，如评估策略、热身步数等
+    # report_to="wandb" # 可选：启用 Weights & Biases 日志记录
+)
+
+# 初始化训练器
+trainer = Trainer(
+    model=peft_model,                      # PEFT 模型（量化基础模型 + LoRA）
+    args=training_args,
+    train_dataset=data["train"],         # 您预处理过的训练数据
+    # eval_dataset=data["validation"],   # 您预处理过的验证数据（可选）
+    tokenizer=tokenizer,
+    # data_collator=... # 如有需要，指定数据整理器
+)
+```
+
+运行微调任务
+
+```python
+# 开始微调
+print("开始 QLoRA 微调...")
+trainer.train()
+
+# 保存训练好的 LoRA 适配器权重
+peft_model.save_pretrained("./qlora-adapter-checkpoint")
+print("QLoRA 适配器已保存。")
+```
