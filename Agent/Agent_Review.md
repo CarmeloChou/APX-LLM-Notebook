@@ -321,3 +321,159 @@ check_data_in_db()
 之前的对话信息可以快速存储在数据库中，对于复杂的任务，长的上下文可以变得非常大，导致运行速度减慢并且更高的计算开销。我们可以通过自动总结过去的内容，减少上下文的存储复杂度。
 
 会话默认隔离信息共享，但如果使用userid则可以在不同会话之间形成信息交叉。
+
+```python
+# Check the state of the new session
+session = await session_service.get_session(
+    app_name=APP_NAME, user_id=USER_ID, session_id="new-isolated-session"
+)
+
+print("New Session State:")
+print(session.state)
+
+# Note: Depending on implementation, you might see shared state here.
+# This is where the distinction between session-specific and user-specific state becomes important.
+```
+
+### b-代理记忆
+
+记忆是一种为代理提供长期知识存储的服务，关键区别在于：
+
+- 会话：短期记忆，单一的对话
+- 记忆：长期的知识储备，可在不同对话中交叉使用
+
+会话就像是应用状态，是暂时的；而记忆则像是数据库，是永久的。
+
+为什么需要记忆？记忆提供对话所没有的能力
+
+| Capability                    | What It Means                                      | Example                                                      |
+| :---------------------------- | :------------------------------------------------- | :----------------------------------------------------------- |
+| **Cross-Conversation Recall** | Access information from any past conversation      | "What preferences has this user mentioned across all chats?" |
+| **Intelligent Extraction**    | LLM-powered consolidation extracts key facts       | Stores "allergic to peanuts" instead of 50 raw messages      |
+| **Semantic Search**           | Meaning-based retrieval, not just keyword matching | Query "preferred hue" matches "favorite color is blue"       |
+| **Persistent Storage**        | Survives application restarts                      | Build knowledge that grows over time                         |
+
+---
+
+**初始化记忆服务**
+
+![](D:\001-Coding\DATA\APX-LLM-Notebook\Agent\Image\Memory.JPG)
+
+```python
+memory_service = (
+    InMemoryMemoryService()
+)  # ADK's built-in Memory Service for development and testing
+```
+
+添加记忆服务到agent
+
+```python
+# Define constants used throughout the notebook
+APP_NAME = "MemoryDemoApp"
+USER_ID = "demo_user"
+
+# Create agent
+user_agent = LlmAgent(
+    model=Gemini(model="gemini-2.5-flash-lite", retry_options=retry_config),
+    name="MemoryDemoAgent",
+    instruction="Answer user questions in simple words.",
+)
+
+print("✅ Agent created")
+```
+
+创建runner
+
+```python
+# Create Session Service
+session_service = InMemorySessionService()  # Handles conversations
+
+# Create runner with BOTH services
+runner = Runner(
+    agent=user_agent,
+    app_name="MemoryDemoApp",
+    session_service=session_service,
+    memory_service=memory_service,  # Memory service is now available!
+)
+
+print("✅ Agent and Runner created with memory support!")
+```
+
+将memory_service 添加到Runner中使得agent可以使用记忆功能，但并非自动实现，需要显式调用：
+
+1. **Ingest data** using `add_session_to_memory()`
+2. **Enable retrieval** by giving your agent memory tools (`load_memory` or `preload_memory`)
+
+使用记忆管理服务，如Vertex AI Memory Bank 可以让对话进行智能提取信息，仅仅InMemoryMemoryService不具有提取功能
+
+```python
+# User tells agent about their favorite color
+await run_session(
+    runner,
+    "My favorite color is blue-green. Can you write a Haiku about it?",
+    "conversation-01",  # Session ID
+)
+
+session = await session_service.get_session(
+    app_name=APP_NAME, user_id=USER_ID, session_id="conversation-01"
+)
+
+# Let's see what's in the session
+print("📝 Session contains:")
+for event in session.events:
+    text = (
+        event.content.parts[0].text[:60]
+        if event.content and event.content.parts
+        else "(empty)"
+    )
+    print(f"  {event.content.role}: {text}...")
+# 将会话添加到记忆    
+# This is the key method!
+await memory_service.add_session_to_memory(session)
+
+print("✅ Session added to memory!")
+```
+
+**激活agent的记忆检索功能**
+
+agents不能直接访问记忆服务，他们需要使用工具来调用记忆服务。
+
+ADK提供两种内在工具来使用记忆检索：
+
+- load_memory(Reactive)
+  - Agent decides when to search memory
+  - Only retrieves when the agent thinks it's needed
+  - More efficient (saves tokens)
+  - Risk: Agent might forget to search
+- preload_memory(Proactive)
+  - Automatically searches before every turn
+  - Memory always available to the agent
+  - Guaranteed context, but less efficient
+  - Searches even when not needed
+
+```python
+# Create agent
+user_agent = LlmAgent(
+    model=Gemini(model="gemini-2.5-flash-lite", retry_options=retry_config),
+    name="MemoryDemoAgent",
+    instruction="Answer user questions in simple words. Use load_memory tool if you need to recall past conversations.",
+    tools=[
+        load_memory
+    ],  # Agent now has access to Memory and can search it whenever it decides to!
+)
+
+print("✅ Agent with load_memory tool created.")
+```
+
+```python
+# Create a new runner with the updated agent
+runner = Runner(
+    agent=user_agent,
+    app_name=APP_NAME,
+    session_service=session_service,
+    memory_service=memory_service,
+)
+
+await run_session(runner, "What is my favorite color?", "color-test")
+```
+
