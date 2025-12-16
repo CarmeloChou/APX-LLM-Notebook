@@ -87,7 +87,7 @@ class Vector{
         other.arr = nullptr;
         capacity = other.capacity;
         other.capacity = 0;
-        
+        num = other.num;
         other.num = 0
     }
     ~Vector(){
