@@ -1,6 +1,6 @@
 # BLIP
 
-[Bootstrapping Language-Image Pre-training](./Paper/BLIP: Bootstrapping Language-Image Pre-training for Unified Vision-Language Understanding and Generation.pdf)
+[Bootstrapping Language-Image Pre-training](./Paper/BLIP Bootstrapping Language-Image Pre-training for Unified Vision-Language Understanding and Generation.pdf)
 
 BLIP 是一个能**同时理解与生成**的多模态预训练模型，通过创新的架构设计和数据清洗策略，在多种视觉语言任务上达到SOTA性能。
 
