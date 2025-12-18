@@ -434,7 +434,7 @@ await memory_service.add_session_to_memory(session)
 print("✅ Session added to memory!")
 ```
 
-**激活agent的记忆检索功能**
+#### **激活agent的记忆检索功能**
 
 agents不能直接访问记忆服务，他们需要使用工具来调用记忆服务。
 
@@ -477,3 +477,227 @@ runner = Runner(
 await run_session(runner, "What is my favorite color?", "color-test")
 ```
 
+sk-xVIOEZ266vo9ObNUOqRdBBfSgSYaVduCUoh2aZm3sbckXAVD
+
+**自助记忆检索功能**
+
+记忆检索功能可以直接在代码中实现，主要用于：
+
+- debugging上下文记忆
+- 简历分析面板
+- 创建自定义的记忆管理UIs
+
+`search_memory()`方法输入一个文本请求，返回一个记忆搜寻的应答
+
+```python
+# Search for color preferences
+search_response = await memory_service.search_memory(
+    app_name=APP_NAME, user_id=USER_ID, query="joke"
+)
+
+print("🔍 Search Results:")
+print(f"  Found {len(search_response.memories)} relevant memories")
+print()
+
+for memory in search_response.memories:
+    if memory.content and memory.content.parts:
+        text = memory.content.parts[0].text[:80]
+        print(f"  [{memory.author}]: {text}...")
+```
+
+**记忆检索是如何起作用的**
+
+**InMemoryMemoryService(本notebook中):**
+
+- **方法**：关键词匹配
+- **示例**："favorite color"（最喜欢的颜色）能够匹配，因为存在这些确切的单词
+- **局限性**："preferred hue"（偏爱的色调）将无法匹配
+
+**VertexAiMemoryBankService（第5天将介绍的）：**
+
+- **方法**：通过嵌入向量进行语义搜索
+- **示例**："preferred hue"（偏爱的色调）**能够**匹配"favorite color"（最喜欢的颜色）
+- **优势**：理解语义含义，而不仅仅是关键词匹配
+
+#### 自动记忆存储
+
+目前我们使用了`add_session_to_memory()`将数据转化为长期记忆。生产系统需要将这个行为自动化。
+
+##### 回调
+
+**想象回调功能在代理的生命周期中是事件监听器。**当一个代理抛出一个请求，它会经历不同的阶段：接受输入，调用llm，调用工具，生成回应。召回可以在每个阶段自定义逻辑而不需要修改代理的核心代码
+
+可用的回调类型：
+
+- **before_agent_callback** → 在代理开始处理请求**之前**运行
+- **after_agent_callback** → 在代理完成本次执行**之后**运行
+- **before_tool_callback** / **after_tool_callback** → 围绕工具调用（调用前/后）
+- **before_model_callback** / **after_model_callback** → 围绕 LLM 调用（调用前/后）
+- **on_model_error_callback** → 当发生错误时运行
+
+常见使用场景：
+
+- **日志记录与可观测性**（追踪代理行为）
+- **自动数据持久化**（如保存到记忆系统）
+- **自定义验证或过滤**
+- **性能监控**
+
+**自动记忆存储的回调**
+
+```python
+async def auto_save_to_memory(callback_context):
+    """Automatically save session to memory after each agent turn."""
+    await callback_context._invocation_context.memory_service.add_session_to_memory(
+        callback_context._invocation_context.session
+    )
+
+
+print("✅ Callback created.")
+```
+
+```python
+# Agent with automatic memory saving
+auto_memory_agent = LlmAgent(
+    model=Gemini(model="gemini-2.5-flash-lite", retry_options=retry_config),
+    name="AutoMemoryAgent",
+    instruction="Answer user questions.",
+    tools=[preload_memory],
+    after_agent_callback=auto_save_to_memory,  # Saves after each turn!
+)
+
+print("✅ Agent created with automatic memory saving!")
+```
+
+```python
+# Create a runner for the auto-save agent
+# This connects our automated agent to the session and memory services
+auto_runner = Runner(
+    agent=auto_memory_agent,  # Use the agent with callback + preload_memory
+    app_name=APP_NAME,
+    session_service=session_service,  # Same services from Section 3
+    memory_service=memory_service,
+)
+
+print("✅ Runner created.")
+```
+
+```python
+# Test 1: Tell the agent about a gift (first conversation)
+# The callback will automatically save this to memory when the turn completes
+await run_session(
+    auto_runner,
+    "I gifted a new toy to my nephew on his 1st birthday!",
+    "auto-save-test",
+)
+
+# Test 2: Ask about the gift in a NEW session (second conversation)
+# The agent should retrieve the memory using preload_memory and answer correctly
+await run_session(
+    auto_runner,
+    "What did I gift my nephew?",
+    "auto-save-test-2",  # Different session ID - proves memory works across sessions!
+)
+```
+
+何时存储？
+
+| Timing                  | Implementation                | Best For                           |
+| ----------------------- | ----------------------------- | ---------------------------------- |
+| **After every turn**    | `after_agent_callback`        | Real-time memory updates           |
+| **End of conversation** | Manual call when session ends | Batch processing, reduce API calls |
+| **Periodic intervals**  | Timer-based background job    | Long-running conversations         |
+
+#### 记忆整合
+
+原始存储的局限性
+
+我们目前存储的内容：
+
+- 每条用户消息
+- 每条代理响应
+- 每个工具调用
+
+存在的问题：
+
+```
+会话：50条消息 = 10,000个token
+记忆：存储所有50条消息
+搜索：返回全部50条消息 → 代理必须处理10,000个token
+```
+
+这种方案不可扩展。我们需要**记忆整合**。
+
+##### 什么是记忆整合
+
+抛弃对话噪音，只提取最重要的因素
+
+**efore (Raw Storage):**
+
+```
+User: "My favorite color is BlueGreen. I also like purple. 
+       Actually, I prefer BlueGreen most of the time."
+Agent: "Great! I'll remember that."
+User: "Thanks!"
+Agent: "You're welcome!"
+
+→ Stores ALL 4 messages (redundant, verbose)
+```
+
+**After (Consolidation):**
+
+```
+Extracted Memory: "User's favorite color: BlueGreen"
+
+→ Stores 1 concise fact
+```
+
+**Benefits:** Less storage, faster retrieval, more accurate answers.
+
+##### 记忆整合如何生效
+
+**The pipeline:**
+
+```
+1. Raw Session Events
+   ↓
+2. LLM analyzes conversation
+   ↓
+3. Extracts key facts
+   ↓
+4. Stores concise memories
+   ↓
+5. Merges with existing memories (deduplication)
+```
+
+**Example transformation:**
+
+```
+Input:  "I'm allergic to peanuts. I can't eat anything with nuts."
+
+Output: Memory {
+  allergy: "peanuts, tree nuts"
+  severity: "avoid completely"
+}
+```
+
+Natural language → Structured, actionable data.结构化、可操作的数据
+
+##### 记忆整合的进阶
+
+**关键要点：托管记忆服务会自动处理记忆整合。**
+
+**你使用相同的API：**
+
+```
+add_session_to_memory() ← 相同的方法
+search_memory() ← 相同的方法
+```
+
+**区别在于后台处理方式：**
+
+- **InMemoryMemoryService**：存储原始事件
+- **VertexAiMemoryBankService**：存储前智能整合记忆
+
+**📚 了解更多：**
+
+- Vertex AI Memory Bank：记忆整合指南 → 你将在第5天探索这个功能！
