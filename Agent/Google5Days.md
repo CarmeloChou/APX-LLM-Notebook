@@ -1547,3 +1547,556 @@ retry_config = types.HttpRetryOptions(
 )
 ```
 
+### 创建产品目录agent
+
+创建产品目录智能体以提供产品信息，这个智能体会通过A2A暴露给其他的智能体。
+
+为何要对外部智能体开放接口？
+
+- 在实际系统中，此类服务通常由外部供应商或第三方服务商维护
+
+- 您内部的智能体（客户支持、销售、库存管理等）需要获取产品数据
+
+- 供应商自主管理其代码库——您无法直接修改其实现
+
+- 通过A2A（应用程序到应用程序）接口公开，任何经过授权的智能体都能采用标准协议调用该服务
+
+```py
+# Define a product catalog lookup tool
+# In a real system, this would query the vendor's product database
+def get_product_info(product_name: str) -> str:
+    """Get product information for a given product.
+
+    Args:
+        product_name: Name of the product (e.g., "iPhone 15 Pro", "MacBook Pro")
+
+    Returns:
+        Product information as a string
+    """
+    # Mock product catalog - in production, this would query a real database
+    product_catalog = {
+        "iphone 15 pro": "iPhone 15 Pro, $999, Low Stock (8 units), 128GB, Titanium finish",
+        "samsung galaxy s24": "Samsung Galaxy S24, $799, In Stock (31 units), 256GB, Phantom Black",
+        "dell xps 15": 'Dell XPS 15, $1,299, In Stock (45 units), 15.6" display, 16GB RAM, 512GB SSD',
+        "macbook pro 14": 'MacBook Pro 14", $1,999, In Stock (22 units), M3 Pro chip, 18GB RAM, 512GB SSD',
+        "sony wh-1000xm5": "Sony WH-1000XM5 Headphones, $399, In Stock (67 units), Noise-canceling, 30hr battery",
+        "ipad air": 'iPad Air, $599, In Stock (28 units), 10.9" display, 64GB',
+        "lg ultrawide 34": 'LG UltraWide 34" Monitor, $499, Out of Stock, Expected: Next week',
+    }
+
+    product_lower = product_name.lower().strip()
+
+    if product_lower in product_catalog:
+        return f"Product: {product_catalog[product_lower]}"
+    else:
+        available = ", ".join([p.title() for p in product_catalog.keys()])
+        return f"Sorry, I don't have information for {product_name}. Available products: {available}"
+
+
+# Create the Product Catalog Agent
+# This agent specializes in providing product information from the vendor's catalog
+product_catalog_agent = LlmAgent(
+    model=Gemini(model="gemini-2.5-flash-lite", retry_options=retry_config),
+    name="product_catalog_agent",
+    description="External vendor's product catalog agent that provides product information and availability.",
+    instruction="""
+    You are a product catalog specialist from an external vendor.
+    When asked about products, use the get_product_info tool to fetch data from the catalog.
+    Provide clear, accurate product information including price, availability, and specs.
+    If asked about multiple products, look up each one.
+    Be professional and helpful.
+    """,
+    tools=[get_product_info],  # Register the product lookup tool
+)
+
+print("✅ Product Catalog Agent created successfully!")
+print("   Model: gemini-2.5-flash-lite")
+print("   Tool: get_product_info()")
+print("   Ready to be exposed via A2A...")
+```
+
+### 通过A2A暴露产品目录代理
+
+现在我们将通过ADK的to_a2a()功能，使产品目录智能体能够被其他智能体访问。
+
+to_a2a()的作用：
+
+- 🔧 将您的智能体封装为兼容A2A协议的服务器（基于FastAPI/Starlette框架）
+
+- 📋 自动生成智能体名片，包含：
+
+  - 智能体名称、描述和版本号
+
+  - 技能（您的工具/函数将转化为A2A协议中的"技能"）
+
+  - 协议版本和接口端点
+
+  - 输入/输出模式
+
+- 🌐 在`/.well-known/agent-card.json`路径提供智能体名片（A2A标准路径）
+
+- ✨ 自动处理所有A2A协议细节（请求/响应格式、任务接口）
+
+这是通过A2A协议开放ADK智能体最便捷的方式！
+
+💡 核心概念：智能体名片
+
+智能体名片是描述智能体信息的JSON文档，相当于智能体的"数字名片"。它定义了：
+
+- 智能体功能（名称、描述、版本）
+
+- 具备的能力（技能、工具、函数）
+
+- 交互方式（URL地址、协议版本、接口端点）
+
+每个A2A智能体都必须在标准路径`/.well-known/agent-card.json`发布其智能体名片。
+
+可将其视为"服务契约"，告知其他智能体如何与您的智能体进行交互。
+
+- [Exposing Agents with ADK](https://google.github.io/adk-docs/a2a/quickstart-exposing/)
+- [A2A Protocol Specification](https://a2a-protocol.org/latest/specification/)
+
+```py
+# Convert the product catalog agent to an A2A-compatible application
+# This creates a FastAPI/Starlette app that:
+#   1. Serves the agent at the A2A protocol endpoints
+#   2. Provides an auto-generated agent card
+#   3. Handles A2A communication protocol
+product_catalog_a2a_app = to_a2a(
+    product_catalog_agent, port=8001  # Port where this agent will be served
+)
+
+print("✅ Product Catalog Agent is now A2A-compatible!")
+print("   Agent will be served at: http://localhost:8001")
+print("   Agent card will be at: http://localhost:8001/.well-known/agent-card.json")
+print("   Ready to start the server...")
+```
+
+### 启动产品目录agent
+
+我们将使用`uvicorn`在后台启动产品目录智能体服务器，以便它能响应其他智能体的请求。
+
+为何采用后台运行模式？
+
+- 服务器需要持续运行，以便我们创建和测试客户支持智能体
+- 这模拟了真实场景中不同智能体作为独立服务运行的实际情况
+
+- 在生产环境中，供应商会在其基础设施上托管此服务
+
+```py
+# First, let's save the product catalog agent to a file that uvicorn can import
+product_catalog_agent_code = '''
+import os
+from google.adk.agents import LlmAgent
+from google.adk.a2a.utils.agent_to_a2a import to_a2a
+from google.adk.models.google_llm import Gemini
+from google.genai import types
+
+retry_config = types.HttpRetryOptions(
+    attempts=5,  # Maximum retry attempts
+    exp_base=7,  # Delay multiplier
+    initial_delay=1,
+    http_status_codes=[429, 500, 503, 504],  # Retry on these HTTP errors
+)
+
+def get_product_info(product_name: str) -> str:
+    """Get product information for a given product."""
+    product_catalog = {
+        "iphone 15 pro": "iPhone 15 Pro, $999, Low Stock (8 units), 128GB, Titanium finish",
+        "samsung galaxy s24": "Samsung Galaxy S24, $799, In Stock (31 units), 256GB, Phantom Black",
+        "dell xps 15": "Dell XPS 15, $1,299, In Stock (45 units), 15.6\\" display, 16GB RAM, 512GB SSD",
+        "macbook pro 14": "MacBook Pro 14\\", $1,999, In Stock (22 units), M3 Pro chip, 18GB RAM, 512GB SSD",
+        "sony wh-1000xm5": "Sony WH-1000XM5 Headphones, $399, In Stock (67 units), Noise-canceling, 30hr battery",
+        "ipad air": "iPad Air, $599, In Stock (28 units), 10.9\\" display, 64GB",
+        "lg ultrawide 34": "LG UltraWide 34\\" Monitor, $499, Out of Stock, Expected: Next week",
+    }
+    
+    product_lower = product_name.lower().strip()
+    
+    if product_lower in product_catalog:
+        return f"Product: {product_catalog[product_lower]}"
+    else:
+        available = ", ".join([p.title() for p in product_catalog.keys()])
+        return f"Sorry, I don't have information for {product_name}. Available products: {available}"
+
+product_catalog_agent = LlmAgent(
+    model=Gemini(model="gemini-2.5-flash-lite", retry_options=retry_config),
+    name="product_catalog_agent",
+    description="External vendor's product catalog agent that provides product information and availability.",
+    instruction="""
+    You are a product catalog specialist from an external vendor.
+    When asked about products, use the get_product_info tool to fetch data from the catalog.
+    Provide clear, accurate product information including price, availability, and specs.
+    If asked about multiple products, look up each one.
+    Be professional and helpful.
+    """,
+    tools=[get_product_info]
+)
+
+# Create the A2A app
+app = to_a2a(product_catalog_agent, port=8001)
+'''
+
+# Write the product catalog agent to a temporary file
+with open("/tmp/product_catalog_server.py", "w") as f:
+    f.write(product_catalog_agent_code)
+
+print("📝 Product Catalog agent code saved to /tmp/product_catalog_server.py")
+
+# Start uvicorn server in background
+# Note: We redirect output to avoid cluttering the notebook
+server_process = subprocess.Popen(
+    [
+        "uvicorn",
+        "product_catalog_server:app",  # Module:app format
+        "--host",
+        "localhost",
+        "--port",
+        "8001",
+    ],
+    cwd="/tmp",  # Run from /tmp where the file is
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+    env={**os.environ},  # Pass environment variables (including GOOGLE_API_KEY)
+)
+
+print("🚀 Starting Product Catalog Agent server...")
+print("   Waiting for server to be ready...")
+
+# Wait for server to start (poll until it responds)
+max_attempts = 30
+for attempt in range(max_attempts):
+    try:
+        response = requests.get(
+            "http://localhost:8001/.well-known/agent-card.json", timeout=1
+        )
+        if response.status_code == 200:
+            print(f"\n✅ Product Catalog Agent server is running!")
+            print(f"   Server URL: http://localhost:8001")
+            print(f"   Agent card: http://localhost:8001/.well-known/agent-card.json")
+            break
+    except requests.exceptions.RequestException:
+        time.sleep(5)
+        print(".", end="", flush=True)
+else:
+    print("\n⚠️  Server may not be ready yet. Check manually if needed.")
+
+# Store the process so we can stop it later
+globals()["product_catalog_server_process"] = server_process
+```
+
+
+
+**查看自动生成的Agent card**
+
+The `to_a2a()` function automatically created an **agent card** that describes the Product Catalog Agent's capabilities. Let's take a look!
+
+```py
+# Fetch the agent card from the running server
+try:
+    response = requests.get(
+        "http://localhost:8001/.well-known/agent-card.json", timeout=5
+    )
+
+    if response.status_code == 200:
+        agent_card = response.json()
+        print("📋 Product Catalog Agent Card:")
+        print(json.dumps(agent_card, indent=2))
+
+        print("\n✨ Key Information:")
+        print(f"   Name: {agent_card.get('name')}")
+        print(f"   Description: {agent_card.get('description')}")
+        print(f"   URL: {agent_card.get('url')}")
+        print(f"   Skills: {len(agent_card.get('skills', []))} capabilities exposed")
+    else:
+        print(f"❌ Failed to fetch agent card: {response.status_code}")
+
+except requests.exceptions.RequestException as e:
+    print(f"❌ Error fetching agent card: {e}")
+    print("   Make sure the Product Catalog Agent server is running (previous cell)")
+```
+
+### 创建顾客支持agent
+
+现在我们将创建一个客户支持智能体，通过A2A协议调用产品目录智能体。
+
+运作原理：
+
+1. 我们通过RemoteA2aAgent为产品目录智能体创建客户端代理
+
+2. 客户支持智能体可以像使用普通工具一样调用产品目录智能体
+
+3. ADK会在后台自动处理所有A2A协议通信
+
+这展示了A2A的核心优势：智能体之间能够像本地调用一样无缝协作！
+
+RemoteA2aAgent的工作原理：
+
+- 这是一个客户端代理，会读取远程智能体的名片
+
+- 将子智能体调用转换为A2A协议请求（通过HTTP POST发送到/tasks端点）
+
+- 自动处理所有协议细节，让您可以像使用常规子智能体一样直接调用
+
+扩展阅读：
+
+- [Consuming Remote Agents with ADK](https://google.github.io/adk-docs/a2a/quickstart-consuming/)
+- [What is A2A?](https://a2a-protocol.org/latest/topics/what-is-a2a/)
+
+```py
+# Create a RemoteA2aAgent that connects to our Product Catalog Agent
+# This acts as a client-side proxy - the Customer Support Agent can use it like a local agent
+remote_product_catalog_agent = RemoteA2aAgent(
+    name="product_catalog_agent",
+    description="Remote product catalog agent from external vendor that provides product information.",
+    # Point to the agent card URL - this is where the A2A protocol metadata lives
+    agent_card=f"http://localhost:8001{AGENT_CARD_WELL_KNOWN_PATH}",
+)
+
+print("✅ Remote Product Catalog Agent proxy created!")
+print(f"   Connected to: http://localhost:8001")
+print(f"   Agent card: http://localhost:8001{AGENT_CARD_WELL_KNOWN_PATH}")
+print("   The Customer Support Agent can now use this like a local sub-agent!")
+```
+
+```py
+# Now create the Customer Support Agent that uses the remote Product Catalog Agent
+customer_support_agent = LlmAgent(
+    model=Gemini(model="gemini-2.5-flash-lite", retry_options=retry_config),
+    name="customer_support_agent",
+    description="A customer support assistant that helps customers with product inquiries and information.",
+    instruction="""
+    You are a friendly and professional customer support agent.
+    
+    When customers ask about products:
+    1. Use the product_catalog_agent sub-agent to look up product information
+    2. Provide clear answers about pricing, availability, and specifications
+    3. If a product is out of stock, mention the expected availability
+    4. Be helpful and professional!
+    
+    Always get product information from the product_catalog_agent before answering customer questions.
+    """,
+    sub_agents=[remote_product_catalog_agent],  # Add the remote agent as a sub-agent!
+)
+
+print("✅ Customer Support Agent created!")
+print("   Model: gemini-2.5-flash-lite")
+print("   Sub-agents: 1 (remote Product Catalog Agent via A2A)")
+print("   Ready to help customers!")
+```
+
+### 测试A2A对话
+
+```py
+async def test_a2a_communication(user_query: str):
+    """
+    Test the A2A communication between Customer Support Agent and Product Catalog Agent.
+
+    This function:
+    1. Creates a new session for this conversation
+    2. Sends the query to the Customer Support Agent
+    3. Support Agent communicates with Product Catalog Agent via A2A
+    4. Displays the response
+
+    Args:
+        user_query: The question to ask the Customer Support Agent
+    """
+    # Setup session management (required by ADK)
+    session_service = InMemorySessionService()
+
+    # Session identifiers
+    app_name = "support_app"
+    user_id = "demo_user"
+    # Use unique session ID for each test to avoid conflicts
+    session_id = f"demo_session_{uuid.uuid4().hex[:8]}"
+
+    # CRITICAL: Create session BEFORE running agent (synchronous, not async!)
+    # This pattern matches the deployment notebook exactly
+    session = await session_service.create_session(
+        app_name=app_name, user_id=user_id, session_id=session_id
+    )
+
+    # Create runner for the Customer Support Agent
+    # The runner manages the agent execution and session state
+    runner = Runner(
+        agent=customer_support_agent, app_name=app_name, session_service=session_service
+    )
+
+    # Create the user message
+    # This follows the same pattern as the deployment notebook
+    test_content = types.Content(parts=[types.Part(text=user_query)])
+
+    # Display query
+    print(f"\n👤 Customer: {user_query}")
+    print(f"\n🎧 Support Agent response:")
+    print("-" * 60)
+
+    # Run the agent asynchronously (handles streaming responses and A2A communication)
+    async for event in runner.run_async(
+        user_id=user_id, session_id=session_id, new_message=test_content
+    ):
+        # Print final response only (skip intermediate events)
+        if event.is_final_response() and event.content:
+            for part in event.content.parts:
+                if hasattr(part, "text"):
+                    print(part.text)
+
+    print("-" * 60)
+
+
+# Run the test
+print("🧪 Testing A2A Communication...\n")
+await test_a2a_communication("Can you tell me about the iPhone 15 Pro? Is it in stock?")
+```
+
+![](./Image/A2A对话.jpg)
+
+### 对话的原理
+
+A2A对话工作流
+
+![](./Image/a2a_03.png)
+
+**A2A 协议通信详解：**
+
+在底层协议层面，整个过程如下：
+
+1. **远程A2A代理** 向 `http://localhost:8001`的 `/tasks`端点发送 HTTP POST 请求
+2. **请求和响应数据** 均遵循 A2A 协议规范
+3. **数据交换格式** 为标准化 JSON
+4. **协议的核心** 是确保任何符合 A2A 标准的代理（无论使用何种语言或框架）都能相互通信
+
+**正是这种标准化** 使得跨组织、跨语言的智能体通信成为可能！
+
+---
+
+**本次交互的具体过程：**
+
+1. **客户提问** 关于 iPhone 15 Pro
+2. **客服支持代理** 收到问题，并判断需要产品信息
+3. **支持代理** 将任务委托给 `product_catalog_agent`子代理
+4. **远程A2A代理** 将此任务转换为 A2A 协议请求
+5. A2A 请求通过 HTTP 发送至 `http://localhost:8001`
+6. **产品目录代理** 接收请求，并调用 `get_product_info("iPhone 15 Pro")`
+7. **产品目录代理** 通过 A2A 响应返回产品信息
+8. **远程A2A代理** 接收响应，并将其传回客服支持代理
+9. **客服支持代理** 整合产品详情，形成最终答复
+10. **客户** 收到完整、有用的回答
+
+**展示的核心优势：**
+
+- **透明性**：客服支持代理无需"知道"产品目录代理是远程服务
+- **标准化协议**：采用 A2A 标准，可兼容任何符合该标准的代理
+- **易于集成**：仅需一行代码即可添加：`sub_agents=[remote_product_catalog_agent]`
+- **职责分离**： 产品数据存放在目录代理（由供应商维护） 客服逻辑存放在支持代理（由您的公司维护）
+
+**实际应用场景**
+
+这种模式能够实现：
+
+- **微服务架构**：每个代理都是一个独立的服务
+- **第三方集成**：轻松对接外部供应商的代理（如产品目录、支付处理等）
+- **跨语言协作**：产品目录代理可以用 Java 编写，而客服代理可以用 Python
+- **团队专业化**： 供应商团队维护产品目录 您的团队维护客服代理
+- **跨组织协作**： 供应商在其基础设施上托管目录服务您通过 A2A 协议进行无缝集成
+
+### 进阶学习
+
+#### 🚀 Enhancement Ideas
+
+Now that you understand A2A basics, try extending this example:
+
+1. **Add More Agents**:
+   - Create an **Inventory Agent** that checks stock levels and restocking schedules
+   - Create a **Shipping Agent** that provides delivery estimates and tracking
+   - Have Customer Support Agent coordinate all three via A2A
+2. **Real Data Sources**:
+   - Replace mock product catalog with real database (PostgreSQL, MongoDB)
+   - Add real inventory tracking system integration
+   - Connect to real payment gateway APIs
+3. **Advanced A2A Features**:
+   - Implement authentication between agents (API keys, OAuth)
+   - Add error handling and retries for network failures
+   - Use the alternative `adk api_server --a2a` approach
+4. **Deploy to Production**:
+   - Deploy Product Catalog Agent to Agent Engine
+   - Update agent card URL to point to production server (e.g., `https://vendor-catalog.example.com`)
+   - Consumer agents can now access it over the internet!
+
+#### 📚 Documentation
+
+**A2A Protocol**:
+
+- [Official A2A Protocol Website](https://a2a-protocol.org/)
+- [A2A Protocol Specification](https://a2a-protocol.org/latest/spec/)
+
+**ADK A2A Guides**:
+
+- [Introduction to A2A in ADK](https://google.github.io/adk-docs/a2a/intro/)
+- [Exposing Agents Quickstart](https://google.github.io/adk-docs/a2a/quickstart-exposing/)
+- [Consuming Agents Quickstart](https://google.github.io/adk-docs/a2a/quickstart-consuming/)
+
+**Other Deployment Options**:
+
+- [Deploy ADK Agents to Cloud Run](https://google.github.io/adk-docs/deploy/cloud-run/)
+- [Deploy to Agent Engine](https://google.github.io/adk-docs/deploy/agent-engine/)
+- [Deploy to GKE](https://google.github.io/adk-docs/deploy/gke/)
+
+## Day5b 代理部署及MemoryBank
+
+**第5节：使用 Vertex AI 记忆库实现长期记忆**
+
+**记忆库解决了什么问题？**
+
+您部署的智能体拥有会话记忆——它能记住您在聊天过程中对话内容。但一旦会话结束，它会忘记所有内容。每次新的对话都从头开始。
+
+**问题所在：**
+
+- 用户今天告诉智能体：“我更喜欢用摄氏温度”
+- 第二天，用户询问天气 → 智能体仍用华氏温度回答（忘记了用户的偏好）
+- 用户每次都需要重复自己的偏好
+
+------
+
+**💡 什么是 Vertex AI 记忆库？**
+
+记忆库让您的智能体具备跨会话的长期记忆：
+
+| 会话记忆           | 记忆库                   |
+| ------------------ | ------------------------ |
+| 单次对话记忆       | 所有对话记忆             |
+| 会话结束即忘记     | 永久记忆                 |
+| “我刚才说了什么？” | “我最喜欢的城市是哪里？” |
+
+**工作原理：**
+
+1. **对话过程中** - 智能体使用记忆工具搜索过去的事实
+2. **对话结束后** - 智能体引擎提取关键信息（例如“用户偏好摄氏温度”）
+3. **下次会话时** - 智能体自动回忆并使用这些信息
+
+**示例：**
+
+- **会话1**：用户说：“我更喜欢摄氏温度”
+- **会话2**（几天后）：用户问：“东京天气如何？” → 智能体自动以摄氏温度回答 ✨
+
+------
+
+**🔧 记忆库与您的部署**
+
+您的智能体引擎部署提供了记忆库所需的基础设施，但默认情况下并未启用。
+
+**要使用记忆库，您需要：**
+
+1. 在智能体代码中添加记忆工具（`PreloadMemoryTool`）
+2. 添加回调函数，将对话保存到记忆库
+3. 重新部署您的智能体
+
+一旦配置完成，记忆库将自动工作——无需额外的基础设施！
+
+------
+
+**📚 进一步了解**
+
+- **[ADK Memory Guide](https://google.github.io/adk-docs/sessions/memory/)** - Complete guide with code examples
+- **[Memory Tools](https://google.github.io/adk-docs/tools/built-in-tools/)** - PreloadMemory and LoadMemory documentation
+- **[Get started with Memory Bank on ADK](https://github.com/GoogleCloudPlatform/generative-ai/blob/main/agents/agent_engine/memory_bank/get_started_with_memory_bank_on_adk.ipynb)** - Sample notebook that demonstrates how to build ADK agents with memory
