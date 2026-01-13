@@ -109,3 +109,61 @@ k_expand(:, 1::2, ...) = k
 
 ```
 
+```cpp
+# include <iostream>
+class Tensor{
+    private:
+    float gradiant;
+    float value;
+    vector<Tensor>* cache;
+    void (Tensor::* backward)();
+    public:
+    Tensor(float v, float g):value(v), gradiant(g), cache(), backward(nullptr) {}
+    
+    ~Tensor(){
+        
+    }
+    
+    void Add(){
+        for(auto input : *cache){
+            input->gradiant += gradiant;
+        }
+    }
+    void Mul(){
+        *cache[0]->gradiant += gradiant * (*cache[1]->value);
+        *cache[1]->gradiant += gradiant * (*cache[0]->value);     
+    }
+    
+    Tensor* Div(){
+        return *cache[0] * (*cache[1])**-1
+    }
+    
+   Tensor* operator+(Tensor& a, Tensor& b){
+       Tensor* out = new Tensor();
+       out->value = a.value + b.value;
+       out->cache->push_back(a);
+       out->cache->push_back(b);
+       
+       out->backward = &Tensor::Add;
+       return out;
+   }
+    
+    Tensor* operator*(Tensor&a, Tensor&b){
+        Tensor* out = new Tensor();
+        out->val = a.value * b.value;
+        out->cache.push_back(a);
+        out->cache.push_backe(b);
+        out->backward = &Tensor::Mul;
+        return out;
+    }
+    
+}
+
+int main(){
+    Tensor* a = new Tensor(1, 1);
+    
+    
+    delete[] a;
+}
+```
+
