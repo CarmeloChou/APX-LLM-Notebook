@@ -65,7 +65,9 @@ find ./data -type f \( -name "*.pdf" -o -name "*.docx" -o -name "*.txt" -o -name
 1000
 ```
 
-## 工作管线及架构
+## 创建企业代码库
+
+### 工作管线及架构
 
 通常一个agentic RAG管线代码库包括一个向量数据库、一系列AI模型以及一个获取管线。然而，当管线越来越复杂的时候，我们需要将整体架构细分为更小的、可管理的组成部分。以下为RAG管线：
 
@@ -124,7 +126,7 @@ scalable-rag-core/                     # Minimal production RAG system
 
 每个部分都由单独的文件夹组成，**具有较好的可编辑性和拓展性**。
 
-## 开发工作流
+### 开发工作流
 
 **最重要的第一步是配置本地开发环境**。可扩展项目通常自动处理开发环境问题，避免每次有新开发者加入就要重新配置环境。开发环境通常包含以下三方面：
 
@@ -304,7 +306,7 @@ volumes:
 
 在我们的`yaml`文件中，我们为每个服务指定了不同的端口，以避免冲突，并在我们的管道运行时便于监控，这也是大规模项目中的最佳实践
 
-## 核心共享实用程序
+### 核心共享实用程序
 
 现在我们已经搭建好了项目结构和开发流程，首先需要的就是一个唯一的ID生成策略。**当用户向我们的RAG机器人发送聊天信息时，很多事情会同时发生**，将它们全部映射起来有助于我们追踪与该特定聊天会话相关的问题，并涵盖RAG流程的各个环节。
 
@@ -334,8 +336,6 @@ def generate_trace_id() -> str:
 ```
 
 同样，为了进行性能监控和优化，我们需要测量 RAG 流水线中各个函数的执行时间。让我们创建一个`libs/utils/timing.py`文件来处理同步和异步函数的执行时间测量。
-
-
 
 ```python
 import functools
@@ -422,3 +422,108 @@ RAG流程的第一部分（无论规模大小）都是将文档导入系统。�
 然而，在**企业级 RAG 管道**中，摄取是一项高吞吐量的异步任务，必须同时处理数千个文件，而不会导致 API 服务器崩溃。
 
 ![](./Image/数据提取.jpg)
+
+**Ray Data 允许我们创建**任务的有向无环图 (DAG)，这些任务可以在集群中的多个节点上并行执行。
+
+这样我们就可以独立地扩展解析（CPU 密集型）和嵌入（GPU 密集型）任务。
+
+### 文档加载和配置
+
+首先，我们需要一个集中式的配置来管理数据摄取参数。像数据块大小或数据库集合这样的值如果硬编码到生产环境中，将会造成灾难性的后果。
+
+![](./Image/文档处理.jpg)
+
+让我们创建`pipelines/ingestion/config.yaml`一个包含所有数据摄取管道配置的文件。
+
+```yaml
+# pipelines/ingestion/config.yaml
+
+chunking:
+	# 512个token是RAG的黄金比例（上下文足够，噪声不多）
+	chunk_size: 512
+	
+	# 重叠部分确保在分割点不会丢失上下文
+	chunk_overlap: 50
+	
+	# 用于递归分割的分隔符（段落 -> 句子 -> 单词）
+	separators: [ "\n\n", "\n", " ", ""]
+	
+embedding:
+	# 要使用的Ray Serve 端点 endpoint
+	: "http://ray-serve-embed:8000/embed"
+	batch_size: 100
+	
+graph:
+	# 控制 LLM 提取速度与成本
+	concurrency: 10
+	
+	# 如果为 true，则严格遵循shcema.py 本体
+	enforce_schema: true
+	
+vector_db:
+	collection_name: "rag_collection"
+	distance_metric: "Cosine"
+```
+
+现在我们需要加载器。在企业系统中，PDF 文件非常占用资源。将一个 100MB 的 PDF 文件加载到内存中可能会导致 Kubernetes 工作进程因内存不足 (OOM) 而被终止。
+
+我们需要一个单独的处理文件，例如`pipelines/ingestion/loaders/pdf.py`，在其中我们使用`unstructured`临时文件来有效地管理内存。
+
+```python
+# pipelines/ingestion/loaders/pdf.py
+import tempfile
+from unstructured.partition.pdf import partition_pdf
+
+def parse_pdf_bytes(file_bytes: bytes, filename: str):
+    """
+    使用临时文件解析PDF文件流以提高内存效率
+    """
+    text_content = ""
+    # 使用磁盘存储而不是RAM以防止处理大文件时工作进程崩溃
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=True) as tmp_file:
+        tmp_file.write(file_bytes)
+        tmp_file.flush()
+        
+        # "hi_res" 策略使用OCR和布局分析
+        elements = partition_pdf(filename=tmp_file.name, strategy="hi_res")
+        for el in elements:
+            text_content += str(el) + "\n"
+    return text_content, {"filename" : filename, "type" : "pdf"}
+```
+
+对于其他格式，我们需要更轻量级的解析器。让我们`pipelines/ingestion/loaders/docx.py`为 Word 文档创建解析器：
+
+```python
+# pipelines/ingestion/loaders/docx.py
+import docx
+import io
+
+def parse_docx_bytes(file_bytes: bytes, filename: str):
+    """解析 .docx文件，提取文本和简单表格"""
+    doc = docx.Document(io.BytesIO(file_bytes))
+    full_text = []
+    
+    for para in doc.paragraphs:
+        if para.text.strip():
+            full_text.append(para.text)
+            
+    return "\n\n".join(full_text), {"filename" :filename, "type" : "docx"}
+```
+
+对于`pipelines/ingestion/loaders/html.py`网页内容，我们必须去除脚本和样式，以避免用 CSS 或 JavaScript 代码污染我们的矢量图。
+
+```python
+# pipelines/ingestion/loaders/html.py
+from bs4 import BeautifulSoup
+
+def parse_html_bytes(file_bytes: bytes, filename: str):
+    """从HTML中清除脚本/样式，提取纯文本"""
+    soup = BeautifulSoup(file_bytes, "html.parser")
+    
+    # 移除LLM会混淆的垃圾元素
+    for script in soup(["script", "style", "meta"]):
+        script.decompose()
+    
+    return soup.get_text(separator= "\n"), {"filename" : filename, "type" : "html"}
+```
+
