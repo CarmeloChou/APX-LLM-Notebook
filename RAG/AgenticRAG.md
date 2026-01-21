@@ -527,3 +527,159 @@ def parse_html_bytes(file_bytes: bytes, filename: str):
     return soup.get_text(separator= "\n"), {"filename" : filename, "type" : "html"}
 ```
 
+### 组块和知识图谱
+
+提取原始文本后，在 RAG 中，接下来我们需要对其进行转换。我们定义了一个分割器，`pipelines/ingestion/chunking/splitter.py`将文本分割成 512 个词元的块，这是许多嵌入模型的标准限制。
+
+![](./Image/文本分割器.jpg)
+
+```python
+# pipelines/ingestion/chunking/splitter.py
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+
+def split_txt(text: str, chun_size: int = 512, overlap: int = 50):
+    """将文本分割成重叠的块，以保留边界处得上下文。"""
+    splitter = RecursiveCharacterTextSplitter(
+    	chunk_size=chunk_size,
+        chunk_overlap=overlap,
+        separators=["\n\n", "\n", ".", " ", ""]
+    )
+    chunks = splitter.create_documents([text])
+    
+    # 映射到Ray管道的字典格式
+    return [{"text" : c.page_content, "metadata" : {"chunk_index" : i}} for i, c in enumerate(chunks)]
+```
+
+```python
+def split_chunk(text: str, chunk_size: int = 512, overlap : int = 50) -> list:
+    len_text = len(text)
+    all_chunk = []
+    assert chunk_size-overlap >= 1; "分块字符数与重叠数至少为1"
+    for i in range(0, len_text, chunk_size-overlap):
+        chunk = text[i:chunk_size]
+        all_chunk.append(chunk)
+    return all_chunk
+```
+
+我们还对这些数据块进行丰富`pipelines/ingestion/chunking/metadata.py`。在分布式系统中，去重非常重要，因此我们生成内容哈希值。
+
+```python
+# pipelines/ingestion/chunking/metadata.py
+import hashlib
+import datetime
+
+def enrich_metadata(base_metadata: dict, content: str) -> dict:
+    """添加哈希值和时间戳以进行去重和新鲜度跟踪"""
+    return {
+        **base_metadata,
+        "chunk_hash": hashlib.md5(content.encode("utf-8")).hexdigest(),
+        "ingested_at": datetime.datetime.utcnow().isoformat()
+    }
+```
+
+现在我们将创建用于生成嵌入的 GPU 工作负载。我们不会在数据导入脚本中加载模型（启动速度较慢），而是调用**Ray Serve**端点。
+
+这样一来，我们的数据摄取任务只需向持续运行的模型服务发出 HTTP 请求即可。我们需要创建`pipelines/ingestion/embedding/compute.py`单独的组件来管理它：
+
+```python
+# pipelines/ingestion/embedding/compute.py
+import httpx
+
+class BatchEmbedder:
+    """Ray Actor，用于批量处理文本块并调用嵌入服务"""
+    def __init__(self):
+        # 我们指向内部k8s服务DNS
+        self.endpoint = "http://ray-serve-embed:8000/embed"
+        self.client =  httpx.Client(timeout=30.0)
+    def __call__(self, batch):
+        """向GPU服务发送一批文本"""
+        response = self.client.post(
+        	self.endpoint,
+            json = {"text" : batch["text"], "task_type" : "document"}
+        )
+        batch["vector"] = response.json()["embeddings"]
+        return batch
+```
+
+同时，我们提取知识图谱。为了保持图谱的整洁，我们必须定义一个严格的模式`pipelines/ingestion/graph/schema.py`。否则，LLM 会生成随机的关系类型。
+
+```python
+# pipelines/ingestion/graph/schema.py
+from typing import Literal
+
+# 将LLM限制为仅包含以下实体/关系
+VALID_NODE_LABELS = Literal["Person", "Organization", "Location", "Concept", "Product"]
+
+VALID_RELATION_TYPES = Literal["WORKS_FOR", "LOCATED_IN", "RELATES_TO", "PART_OF"]
+
+class GraphSchema:
+    @staticmethod
+    def get_system_prompt() -> str:
+        return f"提取节点/边。允许得标签:{VALID_NODE_LABELS.__args__}..."
+```
+
+我们在 中应用此模式`pipelines/ingestion/graph/extractor.py`。它使用 LLM 来理解文本的*结构，而不仅仅是语义相似性。*
+
+```python
+# pipelines/ingestion/graph/extractor.py
+import httpx
+from pipelines.ingestion.graph.schema import GraphSchema
+
+class GraphExtractor:
+    """
+    用于图提取的Ray Actor类
+    调用内部LLM服务提取实体
+    """
+    def __init__(self):
+        # 指向内部Ray Serve LLM端点
+        # 我们使用内部k8s DNS 名称
+        self.llm_endpoint = "http://ray-serve-llm:8000/llm/chat"
+        self.client = httpx.Client(timeout = 60.0) # 较长的超时时间用于推理
+    def __call__(self, batch: Dict[str, Any]) -> Dict[str,Any]:
+        """
+        处理一批文本块
+        """
+        nodes_list = []
+        edges_list = []
+        
+        # 遍历批次中的文本块
+        for text in batch["text"]:
+            try:
+                # 1. 构建提示
+                prompt = f"""
+                {GraphSchema.get_system_prompt()}
+                
+                输入文本：
+                {text}
+                """
+                # 2.调用LLM(Llama-3-70B)
+                response = self.client.post(
+                	self.llm_endpoint,
+                    json={
+                        "messages" : [{"role" : "user", "content" : prompt}],
+                        "temperature" : 0.0, 
+                        "max_tokens" : 1024
+                    }
+                )
+                reponse.raise_for_status()
+                
+                # 3.解析JSON输出
+                # 我们假设模型返回有效的JSON（通过约束解码或后处理保证）
+                content = response.json()["choices"][0]["message"]["content"]
+                graph_data = json.loads(content)
+                
+                # 4.追加到结果
+                nodes_list.append(graph_data.get("nodes", []))
+                edges_list.append(graph_data.get("edges", []))
+			except Exception as e:
+                # 记录错误但不导致管道崩溃，此块返回空图
+                print(f"图提取失败，块：{e}")
+                nodes_list.append([])
+                edges_list.append([])
+	
+	# 将图数据添加到批次batch
+    ["graph_nodes"] = nodes_list
+    batch["graph_edges"] = edges_list
+    return batch
+```
+
