@@ -18,6 +18,10 @@
 - git checkout -- file = 用暂存区覆盖工作区
 - git restore file = 新版的 git checkout -- file
 
+## git pull
+
+代理模式：```git -c https.proxy=127.0.0.1:7897 pull```
+
 ## git stash
 
 git stash是 Git 中一个极其有用的功能，用于临时保存工作目录的修改，让你可以切换分支或执行其他操作，稍后再恢复这些修改。
@@ -86,4 +90,3 @@ git checkout <commit> -- <file>
 # 4. 查看历史版本
 git checkout <commit>
 ```
-
