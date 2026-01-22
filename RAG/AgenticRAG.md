@@ -577,6 +577,8 @@ def enrich_metadata(base_metadata: dict, content: str) -> dict:
     }
 ```
 
+[字典解包运算符](./Knowledge_Added/字典解包运算符.md)
+
 现在我们将创建用于生成嵌入的 GPU 工作负载。我们不会在数据导入脚本中加载模型（启动速度较慢），而是调用**Ray Serve**端点。
 
 这样一来，我们的数据摄取任务只需向持续运行的模型服务发出 HTTP 请求即可。我们需要创建`pipelines/ingestion/embedding/compute.py`单独的组件来管理它：
@@ -677,9 +679,149 @@ class GraphExtractor:
                 nodes_list.append([])
                 edges_list.append([])
 	
-	# 将图数据添加到批次batch
-    ["graph_nodes"] = nodes_list
+	# 将图数据添加到批次
+    batch["graph_nodes"] = nodes_list
     batch["graph_edges"] = edges_list
     return batch
+```
+
+### 高通量索引
+
+在大规模随机存取存储器（RAG）中，我们不逐条插入记录，而是执行批量写入。批量处理可以降低GPU和CPU的负载，从而减少内存使用，使分区可以用于后续的其他任务。
+
+![](./Image/高吞吐量索引.jpg)
+
+对于向量，我们使用`pipelines/ingestion/indexing/qdrant.py`。这会处理与我们的 Qdrant 集群的连接并执行原子 upsert 操作。
+
+[Qdrant Python 客户端文档](https://python-client.qdrant.org.cn/)
+
+```python
+# pipelines/ingestion/indexing/qdrant.py
+
+from qdrant_client import QdrantClient
+from qdrant_client.http import models
+import uuid
+
+class QdrantIndexer:
+    """使用批量upsert将向量写入Qdrant"""
+    def __init__(self):
+        self.client = QdrantClient(host="qdrant-service", post=6333)
+    def write(self, batch):
+        points = [
+            models.PointStruct(id = str(uuid.uuid4()), vector=row["vector"], payload=row["metadata"])
+            for row in batch if "vector" in row
+        ]
+       self.client.upsert(collection_name="rag_collection", points=points)
+```
+
+对于该图，我们创建了它`pipelines/ingestion/indexing/neo4j.py`。我们使用 Cypher`MERGE`语句来确保幂等性，如果我们运行两次数据摄取，我们不希望出现重复节点，这样可以避免 CPU 或 GPU 节点上可能出现的内存问题。
+
+```python
+# pipelines/ingestion/indexing/neo4j.py
+from neo4j import GraphDatabase
+
+class Neo4jIndexer:
+    """使用幂等MERGE查询写入图数据。"""
+	def __init__(self):
+        self.driver = GraphDatabase.driver("bolt://neo4j-cluster:7687", auth=("neo4j", "pass"))
+    def write(self, batch):
+        with self.driver.session() as session:
+            # 将批处理数据扁平化并执行单个事务以提高性能
+            session.execute_write(self._merge_graph_data, batch)
+```
+
+### 使用 Ray 实现事件驱动型工作流
+
+最后，我们需要将所有这些组件整合在一起。我们不需要单个脚本，而需要一个流水线，其中读取、分块和嵌入操作可以在我们 CPU 集群的不同节点上并行执行。为此，我们需要创建`pipelines/ingestion/main.py`一个调度器。
+
+我们将使用**Ray Data**创建一个延迟执行的 DAG（有向无环图）。
+
+```python
+# pipelines/ingestion/main.py
+import ray
+from pipelines.ingestion.embedding.compute import BatchEmbedder
+from pipelines.ingestion.indexing.qdrant import QdrantIndexer
+
+def main(bucket_name:str, prefix:str):
+    """
+    主要编排流程
+    """
+    # 1.使用Ray Data从S3读取数据（延迟加载）
+    # 这会自动将读取任务分配到各个工作进程
+    ds = ray.data.read_binary_files(
+    	paths=f"s3://{bucket_name}/{prefix}",
+        include_paths=True
+    )
+    
+    # 2.解析和分块（映射阶段）
+    # num_cpus=1 告诉Ray为每个解析任务预留1个cpu核心
+    chunked_ds = ds.map_batches(
+    	process_batch,
+        batch_size=10, # 每个工作进程一次处理10个文件
+        num_cpus=1
+    )
+    
+    # 3.FORK: 分支A - 向量嵌入（GPU密集型）
+    # 我们使用一个类Actor（BatchEmbedder）来维护与Ray Serve的连接
+    vector_ds = chunked_ds.map_batches(
+    	BatchEmbedder,
+        concurrency = 5,
+        num_gpus = 0.2,
+        bacth_size = 100
+    )
+    
+    # 4.FORK：分支B-图提取（LLM密集型）
+    # 速度较慢，因此我们可以设置更高的并发性或专用节点
+    graph_ds = chunked_ds.map_batches(
+    	GraphExtractor,
+        concurrency = 10,
+        num_gpus = 0.5,
+        batch_size = 5
+    )
+    
+    # 5.索引（写入数据库）
+    # 触发执行
+    vector_ds.write_datasource(QdrantIndexer())
+    graph_ds.write_datasource(Neo4jIndexer())
+    
+    print("数据导入作业已成功完成。")
+```
+
+为了在我们的 Kubernetes 集群上运行此程序，我们需要定义运行时环境`pipelines/jobs/ray_job.yaml`。这确保我们的工作进程安装了所有必要的 Python 依赖项。
+
+```yaml
+# pipelines/jobs/ray_job.yaml
+entrypoint: "python pipelines/ingestion/main.py"
+runtime_env:
+	working_dir: "./"
+	pip: ["boto3", "qdrant-client", "neo4j", "langchain", "unstructured"]
+```
+
+在企业架构中，我们不会手动触发此操作。**我们使用事件驱动模式**。**当文件上传到 S3 时**，会触发一个事件，该事件会触发在`pipelines/jobs/s3_event_handler.py`.
+
+```python
+# pipelines/jobs/s3_event_handler.py
+from ray.job_submission import JobSubmissionClient
+
+def handle_s3_event(event, context):
+    """由S3 上传触发 -> 提交Ray作业"""
+    client = JobSubmissionClient("http://rag-ray-cluster-head-svc:8265")
+    client.submit_job(
+    	entrypoint=f"python pipelines/ingestion/main.py {bucket} {key}",
+        runtime_env={"working_dir" : "./"}
+    )
+```
+
+最后，为了测试整个过程，我们`scripts/bulk_upload_s3.py`使用多线程上传将之前准备好的噪声数据集上传到我们的 S3 存储桶中。
+
+```python
+# scripts/bulk_upload_s3.py
+from concurrent.futures import ThreadPoolExecutor
+
+def upload_directory(dir_path, bucket_name):
+    """高性能多线程S3上传器"""
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        # 将本地文件映射到S3上传任务
+        executor.
 ```
 
