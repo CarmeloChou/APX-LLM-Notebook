@@ -734,6 +734,8 @@ class Neo4jIndexer:
 
 最后，我们需要将所有这些组件整合在一起。我们不需要单个脚本，而需要一个流水线，其中读取、分块和嵌入操作可以在我们 CPU 集群的不同节点上并行执行。为此，我们需要创建`pipelines/ingestion/main.py`一个调度器。
 
+[k8s集群](./Knowledge_Added/k8s集群.md)
+
 我们将使用**Ray Data**创建一个延迟执行的 DAG（有向无环图）。
 
 ```python
@@ -822,6 +824,173 @@ def upload_directory(dir_path, bucket_name):
     """高性能多线程S3上传器"""
     with ThreadPoolExecutor(max_workers=10) as executor:
         # 将本地文件映射到S3上传任务
-        executor.
+        executor.map(upload_file, files_to_upload)
+```
+
+我们现在已经构建了数据摄取层。现在，只需向 Kubernetes 集群添加更多节点，我们的系统就可以扩展到处理数百万份文档。
+
+在下一部分中，我们将使用分布式模式构建**模型服务器层**，该层将包含我们的模型。
+
+## AI计算层
+
+现在我们有了数据摄取管道，接下来需要处理这些数据的流程。在单体应用中，您可以将 LLM 直接加载到 API 服务器中。
+
+然而，在**企业级红黄绿灯平台**中，这是一个严重的错误……
+
+> 在 Web 服务器中加载 700 亿参数模型会严重影响请求吞吐量，并使扩展成为不可能。
+
+![](./Image/计算层.jpg)我们需要将 FastAPI 与 AI 模型解耦。我们将使用**RayServe**将模型托管为独立的微服务，这些微服务可以根据 GPU 可用性和传入流量自动扩展。
+
+### 模型配置及硬件映射
+
+在生产环境中，我们绝不会将模型参数硬编码到代码中。我们需要灵活的配置，以便能够在不重写代码的情况下切换模型、调整量化级别和优化批次大小。
+
+![](./Image/模型配置.jpg)
+
+让我们来定义一下我们的核心`models/llm/llama-70b.yaml`。我们使用**Llama-3-70B-Instruct**，但由于 70B的参数在 FP16 模式下需要约 140GB 的显存，我们使用**AWQ 量化技术**将其适配到更经济实惠的 GPU 上，这实际上是……
+
+> 许多公司将数据和代理上作为 RAG 系统的重要组成部分，而不是用于生成最终答案的 AI 模型。
+
+```bash
+# models/llm/llama-70b.yaml
+model_config:
+	# HuggingFace Model ID
+	model_id: "meta-llama/Meta-Llama-3-70B-Instruct"
+	
+	# Quantization: AWQ is SOTA for high-throuput inference on Nvidia GPUs
+	quantization: "awq"
+	
+	# 上下文窗口 : Llama-3 支持8k，我们设置在8192
+	max_model_len: 8192
+	
+	# 批处理：对于“数千用户并发”至关重要
+	max_num_seqs: 128
+	
+	# 硬件要求（映射到AWS实例）
+	gpu_memory_utilization: 0.90
+	tensor_parallel_size: 4
+	
+	#停止标记
+	stop_token_ids: [128001, 128009] # <|eot_id|> 特定于Llama-3分词器
+```
+
+注意这里`tensor_parallel_size: 4`。这是企业级配置。它告诉服务引擎，这个单个模型对于单个 GPU 来说太大了，因此必须将权重矩阵无缝地分配到 4 个 GPU 上。
+
+我们还保留了一个较小模型的配置，`models/llm/llama-7b.yaml`我们可以将其用于查询重写或摘要等较轻的任务，以节省成本。
+
+```bash
+# models/llm/llama-7b.yaml
+model_config:
+	model_id: "meta-llama/Meta-Llama-3-8B-Instruct"
+	
+	# 8B可以轻松放入单个T4或A10GPU上
+	quantization: "awq"
+	
+	max_model_len: 8192
+	
+	#由于模型尺寸小，吞吐量可能更高
+	max_num_seqs: 256
+	gpu_memory_utilization: 0.85
+	tensor_parallel_size: 1
+	
+	stop_token_ids: [128001, 128009]
+```
+
+在检索方面，我们在 . 中定义了我们的嵌入模型配置`models/embeddings/bge-m3.yaml`。BGE-M3 非常出色，因为它能够处理密集、稀疏和多语言检索，这对于用户可以使用非英语语言提问的全球企业平台来说非常重要。
+
+```bash
+# models/embeddings/bge-m3.yaml
+model_config:
+	model_id: "BAAI/bge-m3"
+	
+	# 嵌入生成的批次大小（越大，数据导入速度越快）
+	batch_size: 32
+	
+	# 余弦相似度向量归一化
+	normalize_embeddings: true
+	
+	# 精度：FP16在T4/A10 GPU上速度更快
+	dtype: "float16"
+	
+	# 最大序列长度（BGE-M3支持8192，但为了提高RAG精度，以512分块
+	max_seq_length: 8192
+```
+
+最后，为了提高准确率，我们将使用 中定义的重排序器`models/rerankers/bge-reranker.yaml`。该模型对检索到的前几条文档进行重新评分，以在它们进入 LLM 之前过滤掉假阳性，从而显著减少幻觉。
+
+```bash
+# models/rerankers/bge-reranker.yaml
+model_config:
+	model_id: "BAAI/bge-reranker-v2-m3"
+	
+	# 精度设置
+	dtype: "float16"
+	
+	# 输入对（查询+文档）的最大长度
+	max_length: 512
+	
+	# 重排序的批次大小
+	batch_size: 16
+```
+
+### 使用 vLLM 和 Ray 为 AI 模型提供服务
+
+现在我们需要实际运行这些模型。**标准的 HuggingFace 流水线速度太慢，无法满足高并发生产环境的需求**。
+
+> 我们将使用**vLLM**，这是一个高吞吐量的服务引擎，它使用 PagedAttention 来高效地管理内存。
+
+![](./Image/服务逻辑.jpg)我们将 vLLM 封装在 Ray Serve 部署中`services/api/app/models/vllm_engine.py`。该脚本处理引擎的初始化，并公开一个用于生成的异步端点。
+
+```python
+# services/api/app/models/vllm_engine.py
+from ray import serve
+from vllm import AsyncLLMEngine, EngineArgs, SamplingParams
+from transformers import AutoTokenizer # 用于带有聊天模板的分词器
+import os
+
+@serve.deployment(autoscaling_config={"min_replicas":1, "max_replicas":10}, ray_actor_ootions={"num_gpus": 1})
+class VLLMMDeployment:
+    def __init__(self):
+        model_id = os.getenv("MODEL_ID", "meta-llama/Meta-Llama-3-70B-Instruct")
+        # 1.加载分词器以正确格式聊天
+        self.tokenizer = AutoTokenizer.from_pretrained(model_id)
+        
+        args = EngineArgs(
+        	model=model_id,
+            quantization="awq",
+            gpu_memory_utilization=0.90,
+            max_model_len=8192
+        )
+        
+        self.engine = AsyncLLMEngine.from_engine_args(args)
+    async def __call__(self, request):
+        body = await request.json()
+        messages = body.get("messages", [])
+        
+        # 2.使用标准模板应用程序
+        # 这可以正确处理特定模型的系统提示、特殊令牌和角色
+        prompt = self.tokenizer.apply_chat_template(
+        	messages,
+            tokenize = False,
+            add_generation_prompt = True
+        )
+        
+        sampling_params = SamplingParams(
+        	temperature = body.get("temperature", 0.7),
+            max_token_ids = [self.tokenizer.eos_token_id, self.tokenizer.convert_tokens_to_ids("<|eot_id|>")]
+        )
+        
+        request_id = str(os.urandom(8).hex())
+        results_generator = self.engine.generate(prompt, sampling_params, request_id)
+        
+        final_output = None
+        async for request_output in results_generator:
+            final_output = request_output
+            
+        text_output = final_output.outputs[0].text
+        
+        return {"choices": [{"messages":{"content":text_output, "role": "assistant"}}]}
+    
+app = BLLMDeployment.bi
 ```
 
