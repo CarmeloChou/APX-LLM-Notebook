@@ -115,7 +115,7 @@ class Tensor{
     private:
     float gradiant;
     float value;
-    vector<Tensor>* cache;
+    vector<Tensor*> cache;
     void (Tensor::* backward)();
     public:
     Tensor(float v, float g):value(v), gradiant(g), cache(), backward(nullptr) {}
@@ -141,8 +141,8 @@ class Tensor{
    Tensor* operator+(Tensor& a, Tensor& b){
        Tensor* out = new Tensor();
        out->value = a.value + b.value;
-       out->cache->push_back(a);
-       out->cache->push_back(b);
+       out->cache.push_back(&a);
+       out->cache.push_back(&b);
        
        out->backward = &Tensor::Add;
        return out;
@@ -151,8 +151,7 @@ class Tensor{
     Tensor* operator*(Tensor&a, Tensor&b){
         Tensor* out = new Tensor();
         out->val = a.value * b.value;
-        out->cache.push_back(a);
-        out->cache.push_backe(b);
+        out->cache.push_backe(&b);
         out->backward = &Tensor::Mul;
         return out;
     }
