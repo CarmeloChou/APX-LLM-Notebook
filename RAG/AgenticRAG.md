@@ -991,6 +991,116 @@ class VLLMMDeployment:
         
         return {"choices": [{"messages":{"content":text_output, "role": "assistant"}}]}
     
-app = BLLMDeployment.bi
+app = BLLMDeployment.bind()
+```
+
+通过使用` @serve.deployment`，我们告诉 Ray 管理此类的生命周期。这`autoscaling_config`是关键的企业级特性：如果流量激增，Ray 会检测到负载并自动启动更多副本，并在空闲时缩减规模以节省云成本。
+
+### 服务嵌入和重新排序
+
+嵌入模型不需要像 vLLM 那样庞大的后端，但它们确实需要高效的批处理**。**
+
+> **如果 50 个用户同时进行搜索，我们希望在一次 GPU 处理中对所有 50 个查询进行编码，而不是 50 次顺序处理**。
+
+我们在 中实现了这一点`services/api/app/models/embedding_engine.py`。请注意，我们的分配方式`num_gpus: 0.5 `允许我们将两个嵌入模型打包到单个 GPU 上，从而大大节省了成本。
+
+```python
+# services/api/app/models/embedding_engine.py
+from ray import serve
+from sentence_transformers import SentenceTransformer
+import os
+import torch
+
+@serve.deployment(
+	num_replicas=1,
+    ray_actor_options={"num_gpus":0.5} # 共享GPU
+)
+
+class EmbedDeployment:
+    def __init__(self):
+        # 将模型加载到GPU上
+        model_name = "BAAI/bge-m3"
+        self.model = SentenceTransformer(model_name, device="cuda")
+        
+        # 编译以提高速度（可选，需要PyTorch 2.0+）
+        self.model = torch.compile(self.model)
+    async def __call__(self, request):
+        body = await request.json()
+        texts = body.get("text")
+        task_type = body.get("task_type", "document")
+        
+        # BGE-M3对指令的处理方式不同，此处简化：
+        if isinstance(texts, str):
+            texts = [texts]
+            
+        # 编码
+        embeddings = self.model.encode(
+        	texts,
+            batch_size = 32,
+            normalize_embeddings = True
+        )
+        
+      	return {"embeddings": embeddings.tolist()}
+
+app = EmbedDeployment.bind()
+```
+
+此部署方案使用同一个共享资源池来处理文档嵌入（数据摄取期间）和查询嵌入（聊天期间）。我们利用`torch.compile`该资源池优化模型执行图，最大限度地发挥 GPU 的性能。
+
+### 异步内部客户端
+
+最后，我们的 API 层需要一种与这些 Ray 服务通信的方式。由于这些模型作为独立的微服务运行，我们通过 HTTP 进行通信。
+
+![](./Image/异步调用.jpg)
+
+我们需要非阻塞客户端来确保 FastAPI 服务器在等待 GPU 时保持响应。让我们创建一个`services/api/app/clients/ray_llm.py`包含连接池和重试机制的 LLM 通信处理程序。
+
+```python
+# services/api/app/clients/ray_llm.py
+import httpx
+import logging
+import backoff
+from typing import List, Dict, Optional
+from services.api.app.config import settings
+
+logger = logging.getLogger(__name__)
+
+class RayLLMClient:
+    """
+    具有正确连接池的异步客户端
+    """
+    def __init__(self):
+        self.endpoint = settings.RAY_LLM_ENDPOINT
+        # 客户端在startup_event中初始化
+        self.client: Optional [httpx.AsyncClient] = None
+        async  def  start ( self ): 
+        """在应用程序启动期间调用""" 
+        # 限制：防止打开过多的 Ray 连接
+        limits = httpx.Limits(max_keepalive_connections= 20 , max_connections= 50 ) 
+        self.client = httpx.AsyncClient( 
+            timeout= 120.0 , 
+            limits=limits 
+        ) 
+        logger.info( "Ray LLM 客户端已初始化。." ) 
+    async  def  close ( self ): 
+        """在应用关闭期间调用""" 
+        if self.client: 
+            await self.client.aclose() 
+    @backoff.on_exception( backoff.expo, httpx.HTTPError, max_tries= 3 ) 
+    async  def  chat_completion ( self, messages: List [ Dict ], temperature: float = 0.7 , json_mode: bool = False ) -> str : 
+        if  not self.client: 
+            raise RuntimeError( "客户端未初始化。请先调用 start()。." ) 
+        payload = { 
+            "messages" : messages, 
+            "temperature" : temperature, 
+            "max_tokens" : 1024
+         } 
+        
+        response = await self.client.post(self.endpoint, json=payload) 
+        response.raise_for_status() 
+        return response.json()[ "choices" ][ 0 ][ "message" ][ "content" ]
+
+# 全局实例（由 main.py 中的 Lifespan 管理）
+ llm_client = RayLLMClient()
 ```
 
