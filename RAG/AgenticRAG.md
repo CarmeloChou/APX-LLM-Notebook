@@ -1065,7 +1065,7 @@ from services.api.app.config import settings
 
 logger = logging.getLogger(__name__)
 
-class RayLLMClient:
+clas RayLLMClient:
     """
     具有正确连接池的异步客户端
     """
@@ -1073,34 +1073,167 @@ class RayLLMClient:
         self.endpoint = settings.RAY_LLM_ENDPOINT
         # 客户端在startup_event中初始化
         self.client: Optional [httpx.AsyncClient] = None
-        async  def  start ( self ): 
-        """在应用程序启动期间调用""" 
-        # 限制：防止打开过多的 Ray 连接
-        limits = httpx.Limits(max_keepalive_connections= 20 , max_connections= 50 ) 
-        self.client = httpx.AsyncClient( 
-            timeout= 120.0 , 
-            limits=limits 
-        ) 
-        logger.info( "Ray LLM 客户端已初始化。." ) 
-    async  def  close ( self ): 
-        """在应用关闭期间调用""" 
-        if self.client: 
-            await self.client.aclose() 
-    @backoff.on_exception( backoff.expo, httpx.HTTPError, max_tries= 3 ) 
-    async  def  chat_completion ( self, messages: List [ Dict ], temperature: float = 0.7 , json_mode: bool = False ) -> str : 
-        if  not self.client: 
-            raise RuntimeError( "客户端未初始化。请先调用 start()。." ) 
-        payload = { 
-            "messages" : messages, 
-            "temperature" : temperature, 
-            "max_tokens" : 1024
-         } 
+    async def start(self):
+        """在应用程序启动期间调用"""
+        # 限制：防止打开过多的Ray连接
+        limits = httpx.Limits(max_keepalive_connections=20, max_connections=5)
+        self.client = httpx.AsyncClient(
+        	timeout = 120.0,
+            limits = limits
+        )
+        logger.info("Ray LLM 客户端已初始化")
+    async def close(self):
+        """在应用关闭期间调用"""
+        if self.client:
+            await self.client.aclose()
+    @backoff.on_exception(backoff.expo, httpx.HTTPError, max_tries=3)
+    async def chat_completion(self, message:List[Dict], temperature:float=0.7, json_model:bool=False)->str:
+        if not self.client:
+            raise RuntimeError("客户端未初始化。请先调用start()")
+        payload = {
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": 1024            
+        }
         
-        response = await self.client.post(self.endpoint, json=payload) 
-        response.raise_for_status() 
-        return response.json()[ "choices" ][ 0 ][ "message" ][ "content" ]
+        response = await self.client.post(self.endpoint, json=payload)
+        response.raise_for_status()
+        
+        return response.json()["choices"][0]["message"]["content"]
 
-# 全局实例（由 main.py 中的 Lifespan 管理）
- llm_client = RayLLMClient()
+# 全局实例（由main.py中的Lifespan管理)
+llm_client = RayLLMClient()
+```
+
+这里所用的机制`backoff`对分布式系统至关重要。如果网络出现故障或 Ray 繁忙，系统不会崩溃；而是会进行指数级等待并重试，从而确保高可用性。
+
+同样，我创建了`services/api/app/clients/ray_embed.py`的嵌入服务。该客户端处理**“查询”**嵌入（用于搜索）和**“文档”**嵌入（用于摄取）之间的区别。
+
+> 在检索增强生成（RAG）系统中，“查询嵌入”通常指对用户搜索问题生成的向量表示，用于实时检索；而“文档嵌入”指对知识库中文档块生成的向量，用于预先构建可搜索的索引。这种区分确保了搜索的准确性和效率。
+
+随着这些客户端的编码完成，我们的 API 代码（我们接下来将构建）可以将 700 亿参数模型视为简单的异步函数调用，完全消除 GPU 管理和分布式推理的复杂性。
+
+在下一部分中，我们将构建**Agentic 管道（将 RAG 转换为 Agentic RAG）**，该逻辑决定何时使用这些模型来回答用户问题。
+
+## 智能体人工智能管道
+
+我们有数据摄取管道和运行在分布式集群上的 AI 模型。在一个简单的 RAG 应用中，你可能只需要将检索调用链接到 LLM 生成调用即可。
+
+![](./Image/智能体管道.jpg)
+
+然而，对于**企业代理平台而言**，线性链是脆弱的。
+
+> 当用户改变话题、提出数学问题或说话含糊不清时，它们就会失效。
+
+我们正在使用**FastAPI**和**LangGraph构建一个**事件驱动代理。这使得我们的系统能够**“推理”**用户的意图循环，自我纠正，并动态地选择工具，同时异步处理数千个并发的 WebSocket 连接。
+
+### API 基础与可观测性
+
+首先，我们需要定义环境和安全标准。企业级 API 不能是一个**黑盒**，我们需要结构化的日志和追踪信息来调试特定查询为何耗时 5 秒而不是 500 毫秒。
+
+![](./Image/FastAPI.jpg)
+
+让我们验证一下我们的依赖项`services/api/requirements.txt`。我们引入这些依赖项`fastapi`是为了提高速度、`langgraph`便于编排和`opentelemetry`便于观察。
+
+```bash
+# services/api/requirements.txt
+
+# 核心框架
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+pydantic==2.6.0
+pydantic-settings==2.1.0
+simpleeval==0.9.13 # 安全的数学计算
+
+# 异步数据库和缓存
+sqlalchemy==2.0.25
+asyncpg==0.29.0
+redis==5.0.1
+
+# AI和LLM客户端
+openai==1.10.0 # 标准客户端，通常用于兼容的端点
+anthropic==0.8.0 # 如果使用Claude作为备用
+tiktoken==0.2.2
+sentence-transformers==2.3.1
+transformers==4.37.0 # 用于分词器模板
+
+# 图数据库和向量数据库
+neo4j==5.16.0 
+qdrant-client==1.7.3 
+
+# 代理框架
+langchain==0.1.5 
+langgraph==0.0.21 
+
+# 可观测性与运维
+opentelemetry-api==1.22.0 
+opentelemetry-sdk==1.22.0 
+opentelemetry-exporter-otlp==1.22.0 
+prometheus-client==0.19.0 
+python-json-logger==2.0.7 
+backoff==2.2.1 
+
+# 安全
+python-jose[cryptography]==3.3.0 
+passlib[bcrypt]==1.7.4 
+python-multipart==0.0.6 
+
+# 实用工具
+boto3==1.34.34 
+httpx==0.26.0 
+tenacity==8.2.3
+```
+
+此需求文件确保我们拥有高性能系统所需的所有异步驱动程序（`asyncpg`，`redis`）和可观测性工具（ ）。其中包含和重点突出是为了提高可靠性，即内部调用失败时自动重试的逻辑。`opentelemetry``backoff``tenacity`
+
+接下来，我们`services/api/app/config.py`使用 Pydantic 设置进行创建。这会在启动时验证所有数据库 URL 和 API 密钥是否存在，从而防止后续运行时崩溃。
+
+```python
+# services/api/app/config.py
+from pydantic_settings import BaseSettings
+from typing import Optional
+
+class Settings(BaseSettings):
+    """
+    应用程序配置。
+    自动读取环境变量（不区分大小写）
+    """
+    # 通用
+    ENV: str = "prod"
+    LOG_LEVEL: str = "INFO"
+    
+    # 数据库（Aurora Postgres）
+    DATABASE_URL: str # 例如，postgresql+asyncpg://user:pass@host:5432/db
+    
+    # Redis(缓存)
+    REDIS_URL: str
+    
+    # 向量数据库(Qdrant)
+    QDRANT_HOST: str = "qdrant-service"
+    QDRANT_PORT: int = 6333
+    QDRANT_COLLECTION: str = "rag_collection"
+        
+    # 图数据库（Neo4j)
+    NEO4J_URL: str = "bolt://neo4j-cluster:7687"
+	NEO4J_USER: str = "neo4j"
+    NEO4J_PASSWORD: str #敏感信息
+    
+    # AWS S3(文档)
+    AWS_REGION: str = "us-east-1"
+    S3_BUCKET_NAME: str
+    
+    # Ray Serve(内部LLM/嵌入)
+    RAY_LLM_ENDPOINT: str = "http://llm-service:8000/llm"
+    RAY_EMBED_ENDPOINT: str = "http://embed-service:8000/embed"
+        
+    # 安全
+    JWT_SECRET_KEY: str
+    JWT_ALGORITHM: str = "HS256"
+    
+    class Config:
+        env_file = ".env"
+
+# 实例化单例
+settings = Se
 ```
 
