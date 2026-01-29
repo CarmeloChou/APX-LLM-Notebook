@@ -156,9 +156,96 @@ Python有一个叫做全局解释器锁 (Global Interpreter Lock， GIL) 的机�
 [进程、线程和协程之间的区别和联系_进程和线程和协程-CSDN博客](https://blog.csdn.net/daaikuaichuan/article/details/82951084)
 
 ```python
-import thread
+import threading
+import time
+from functools import wraps
 
-class Test(threading.Thread):
+def time_count(func):
+    @wraps(func)
+    def wrapper(*args, **kargs):
+        start = time.perf_counter()
+        result = func(*args, **kargs)
+        end = time.perf_counter()
+        print(f"普通操作耗时：{end-start}")
+        return result
     
+    @wraps(func)
+    async def asyncwrapper(*args, **kargs):
+        start = time.perf_counter()
+        result = await func(*args, **kargs)
+        end = time.perf_counter()
+        print(f"普通操作耗时：{end-start}")
+        return result
+    return asyncwrapper if asyncio.iscoroutinefunction(func) else wrapper
+
+class test_thread(threading.Thread):
+    def __init__(self, thread_id=None, data=100):
+        super().__init__()
+        self.result = [i for i in range(data)]
+        if thread_id is not None:
+            self.name = f"Thread-{thread_id}"
+
+    def print_all(self):
+        for i in self.result:
+            print(f"This is {self.name}")
+            time.sleep(0.1)
+            print(i)
+
+    @time_count
+    def run(self):
+        self.print_all()
+
+num_thread = 4
+threads = []
+results = []
+for i in range(num_thread):
+    thread = test_thread(i, 100//num_thread) # 这里使用/计算结果为浮点数，需要使用整数
+    threads.append(thread)
+    thread.start()
+
+for thread in threads:
+    thread.join()
+
+```
+
+## logging
+
+logging日志模块，为python自带的日志系统，可追踪程序的运行状态、调试错误以及记录重要信息。
+
+>- **DEBUG**：详细的调试信息，通常用于开发阶段。
+>- **INFO**：程序正常运行时的信息。
+>- **WARNING**：表示潜在的问题，但程序仍能正常运行。
+>- **ERROR**：表示程序中的错误，导致某些功能无法正常工作。
+>- **CRITICAL**：表示严重的错误，可能导致程序崩溃。
+
+```python
+import logging
+
+logging.basicConfig(level=logging.DEBUG)
+
+logging.debug("这是一条调试信息")
+logging.info("这是一条普通信息")
+logging.warning("这是一条警告信息")
+logging.error("这是一条错误信息")
+logging.critical("这是一条严重错误信息")
+
+```
+
+```python
+# 可以修改日志输出的格式
+logging.basicConfig(
+	level=logging.DEBUG,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
+```
+
+```python
+# 手动清除logging
+root_logger = logging.getLogger()
+# 2. 清除所有处理器
+for handler in root_logger.handlers[:]:  # 使用[:]创建副本
+    root_logger.removeHandler(handler)
+    handler.close()  # 重要：释放资源
 ```
 
