@@ -1234,6 +1234,66 @@ class Settings(BaseSettings):
         env_file = ".env"
 
 # 实例化单例
-settings = Se
+settings = Settings()
+```
+
+它作为整个 API 的中心数据源。通过使用 Pydantic，我们确保如果缺少关键密钥`JWT_SECRET_KEY`，Pod 将立即启动失败**（快速失败原则）**，并立即向运维团队发出警报。
+
+为了使日志能够被 Datadog 或 Splunk 等工具读取，我们将实现结构化的 JSON 日志记录`services/api/app/logging.py`。
+
+```python
+# services/api/app/logging.py
+import logging
+import json
+import sys
+from datetime import datetime
+
+class JSONFormatter(logging.Formatter):
+    """
+    将日志记录格式化为JSON对象。
+    包含时间戳、级别和消息。
+    """
+    def format(self, record):
+        log_record = {
+            "timestamp": datetime.utcnow().isoformat(),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+            "module": record.module,
+            "line": record.lineno
+        }
+        
+        # 添加额外信息（如有）
+        if record.exc_info:
+            log_record["exception"] = self.formatException(record.exc_info)
+            
+        # 添加额外字段（例如：user_id, trace_id)
+        if hasattr(record, "request_id"):
+            log_record["request_id"] = record.request_id
+        
+        return json.dumps(log_record)
+    
+    def setup_logging():
+        """
+        配置根日志记录输出JSON格式到标准输出
+        """
+        handler = logging.StreamHandler(sys.stdout)
+        handler.setFormatter(JSONFormatter())
+        
+        root_logger = logging.getLogger()
+        root_logger.setLevel(logging.INFO)
+        
+        # 移除默认处理程序以避免重复日志
+        if root_logger.handlers:
+            root_logger.handlers = []
+        
+        root_logger.addHandler(handler)
+        
+        # 静默部分杂乱的库
+        logging.getLogger("uvicorn.access").disabled = True
+        logging.getLogger("httpx").setLevel(logging.WARNING)
+        
+# 导入时初始化
+setup_l
 ```
 
