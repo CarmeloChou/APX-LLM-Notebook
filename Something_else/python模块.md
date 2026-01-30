@@ -223,6 +223,14 @@ import logging
 
 logging.basicConfig(level=logging.DEBUG)
 
+# 可以修改日志输出的格式
+logging.basicConfig(
+	level=logging.DEBUG,
+    # 输出的格式，时间-名称-r
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
+
 logging.debug("这是一条调试信息")
 logging.info("这是一条普通信息")
 logging.warning("这是一条警告信息")
@@ -231,13 +239,12 @@ logging.critical("这是一条严重错误信息")
 
 ```
 
-```python
-# 可以修改日志输出的格式
-logging.basicConfig(
-	level=logging.DEBUG,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S"
-)
+```bash
+2026-01-30 09:55:19 - root - DEBUG - 这是一条调试信息
+2026-01-30 09:55:19 - root - INFO - 这是一条调试信息
+2026-01-30 09:55:19 - root - WARNING - 这是一条调试信息
+2026-01-30 09:55:19 - root - ERROR - 这是一条错误信息
+2026-01-30 09:55:19 - root - CRITICAL - 这是一条严重错误信息
 ```
 
 ```python
