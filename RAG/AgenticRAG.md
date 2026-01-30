@@ -1294,6 +1294,206 @@ class JSONFormatter(logging.Formatter):
         logging.getLogger("httpx").setLevel(logging.WARNING)
         
 # 导入时初始化
-setup_l
+setup_logging()
+```
+
+当运行 50 个 Pod 时，标准的文本日志就显得力不从心了。JSON 日志允许我们像查询数据库一样查询日志，按错误级别或特定请求 ID 进行筛选，从而跨分布式节点追踪错误。
+
+我们还启用了分布式追踪功能`services/api/app/observability.py`。该功能可以追踪从 API 到 Redis，再到 Vector DB，最后到 Ray 集群的请求流。
+
+```python
+# services/api/app/observability.py
+from fastapi import FastAPI
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+from libs.observability.tracing import configure_tracing
+
+def setup_observability(app: FastAPI):
+    """
+    配置OpenTelemetry并将其附加到FastAPI应用
+    """
+    # 1.配置追踪器（将数据发送到Jaeger/Datadog)
+    configure_tracing(service_name="rag-api-service")
+    
+    # 2.自动检测FastAPI
+    # 这将自动为每个请求创建span
+    FastAPIInstrumentor.instrument_app(app)
+```
+
+我们都知道安全不容妥协。我们在系统中实现了 JWT（JSON Web Token）验证`services/api/app/auth/jwt.py`。该中间件确保只有授权用户才能查询我们昂贵的 GPU 资源。
+
+```python
+# services/api/app/auth/jwt.py
+from fastapi import Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordBearer
+from jose import JWTError, jwt
+from services.api.app.config import settings
+import time
+
+# OAuth2 scheme 告诉Swagger UI将token发送到哪里
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
+async def get_current_user(token: str = Depends(oauth2_scheme)) -> dict:
+    """
+    验证Authorization标头中的JWT Token
+    解码用户信息（ID、角色、权限）
+    """
+    credentials_exception = HTTPException(
+    	status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="无法验证凭据",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    
+    try:
+        #1. 解码令牌
+        # 使用配置中定义的密钥验证签名
+        payload = jwt.decode(
+        	token,
+            settins.JWT_SECRET_KEY,
+            algorithms=[settings.JWT_ALGORITHM]
+        )
+        
+        user_id: str = payload.get("sub")
+        role: str = payload.get("role", "user")
+            
+        if user_id is None:
+            raise credentials_exception
+        
+        # 2.检查过期时间（如果jwt.decode已经执行此操作，则此步骤是多余的，但为了安全起见，这样做比较好）
+        exp = payload.get("exp")
+        if exp and time.time() > exp:
+            raise HTTPException(status_code=401, detail="令牌已过期")
+        return {
+            "id": user_id,
+            "role": role,
+            "permissions": payload.get("permissions", [])
+        }
+    except JWTError:
+        raise credentials_exception
+```
+
+最后，我们在`libs/schemas/chat.py`中定义数据合约。这确保前端发送的内容与我们预期的完全一致，并接收一致的响应结构。
+
+```python
+# lib/schemas/chat.py
+from pydantic import BaseModel, Field
+from typing import List, Optional, Dict, Any
+from datetime import datetime
+
+class Message(BaseModel):
+    role: str
+    content: str
+    timestamp: datetime = Field(default_factory=datetime.utcnow)
+        
+class ChatRequest(BaseModel):
+    message: str
+    session_id: Optional[str] = None
+    stream: bool = True
+    
+    # 高级用户可选过滤器（例如，“仅搜索人力资源档案”）
+    filters: Optional[Dict[str, Any]] = None
+
+class ChatResponse(BaseModel):
+    """
+    非流式调用的标准响应结构
+    """
+    answer: str
+    session_id: str
+    # 引用对于“工业”RAG建立信任至关重要
+    citations: List[Dict[str, str]] = []
+    latency_ms: float
+
+class RetrievalResult(BaseModel):
+    """
+    由检索节点使用
+    """
+    content: str
+    source: str
+    score: float
+    metadata: Dict[str, Any]
+```
+
+这种严格的类型定义使我们能够自动生成 Swagger 文档，并防止“垃圾数据”导致我们的代理在管道下游崩溃。
+
+### 异步数据网关
+
+可扩展的 API 绝不能阻塞主线程。我们需要为所有数据库提供异步客户端，这样单个 API 工作进程就可以处理数百个等待的连接，同时数据库也在处理数据。
+
+![](./Image/异步数据网关.jpg)
+
+首先，我们需要构建`services/api/app/clients/redis.py`一个负责高速缓存和速率限制的程序。
+
+```python
+# services/api/app/clients/redis.py
+import redis.asyncio as redis
+from services.api.app.config import settings
+
+class RedisClient:
+    """
+    单例Redis连接池
+    用于速率限制和语义缓存存储
+    """
+    def __init__(self):
+        self.redis = None
+    
+    async def connect(self):
+    	if not self.redis:
+            # decode_responses=True 表示我们返回的是字符串而不是字节
+            self.redis = redis.from_url(
+            	settings.REDIS_URL,
+                encoding="utf-8",
+                decode_responses=True
+            )
+	
+    async def close(self):
+        if self.redis:
+            await self.redis.close()
+
+	def get_client(self):
+        """返回原始Redis客户端实例"""
+        return self.redis
+
+# 全局实例
+redis_client = RedisClient()
+```
+
+这种单例模式可以高效地重用连接，从而防止经常困扰架构不良应用程序的**“连接过多”错误。**
+
+接下来，我们将创建`services/api/app/clients/qdrant.py`向量搜索。我们使用 Qdrant 客户端的异步版本来执行非阻塞相似性搜索。
+
+```python
+# services/api/app/clients/qdrant/py
+from qdrant_client import QdrantClient, AsyncQdrantClient
+from services.api.app.config import settins
+
+class VectorDBClient:
+    """
+    Qdrant的异步客户端
+    """
+    def __init__(self):
+        self.client = AsyncQdrantClient(
+        	host=settings.QDRANT_HOST,
+            port=settings.QDRANT_PORT,
+            # 在生产环境中，我们启用gRPC以获得略微更快的性能
+            prefer_grpc=True
+        )
+        
+	async def search(self, vector:list[float], limit:int=5):
+        """
+        执行语义搜索
+        """
+        return await self.client.search(
+        	collection_name=settins.QDRANT_COLLECTION,
+            query_vector=vector,
+            limit=limit,
+            with_payload=True
+        )
+    
+# 全局实例
+qdrant_client=VectorDBClient()
+```
+
+对于`services/api/app/clients/neo4j.py`图搜索，此驱动程序管理连接池以高效运行 Cypher 查询。
+
+```python
+# services/api/app/clients/neo4j.py
 ```
 
