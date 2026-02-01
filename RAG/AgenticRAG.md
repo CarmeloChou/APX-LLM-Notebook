@@ -1495,5 +1495,49 @@ qdrant_client=VectorDBClient()
 
 ```python
 # services/api/app/clients/neo4j.py
+from neo4j import GraphDatabase, AsyncGraphDatabase
+from services.api.app.config import settings
+import logging
+
+logger = logging.getLogger(__name__)
+
+class Neo4jClient:
+    """
+    Neo4j驱动程序的单例包装器
+    支持异步执行，以处理高并发API
+    """
+    def __init__(self):
+        self._driver = None
+    def connect(self):
+        """初始化连接池"""
+        if not self.driver:
+            try:
+                # 创建带身份验证的驱动程序
+                self._driver = AsyncGraphDatabase.driver(
+                settings.NEO4J_USER, settings.NEO4J_PASSWORD
+                )
+                logger.info("成功连接到Neo4j")
+            except Exception as e:
+                logger.error(f"连接到Neor4j失败{e}")
+                raise
+                
+	async def close(self):
+        """关闭连接池"""
+        if self._driver:
+            await self._driver.close()
+	
+    async def query(self, cypher_query:str, parameters: dict = None):
+        """
+        执行Cypher查询并返回结果
+        """
+        if not self._driver:
+            await self.connect()
+		
+        async with self._driver.session() as session:
+            result = await session.run(cypher_query, parameters or {})
+            return [record.data() async for record in result]
+
+# 全局实例
+neo4j_client = Neo4jClient()
 ```
 
