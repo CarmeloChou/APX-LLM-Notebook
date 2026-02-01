@@ -6,6 +6,33 @@
 
 协程是 `asyncio` 的核心概念之一。它是一个特殊的函数，可以在执行过程中暂停，并在稍后恢复执行。协程通过 `async def` 关键字定义，并通过 `await` 关键字暂停执行，等待异步操作完成。
 
+### 使用方法
+
+async 定义异步函数、上下文、迭代器
+
+```python
+
+async def func():
+    pass
+
+async with lock:
+    pass
+
+async for i in range(100):
+    pass
+
+```
+
+await等待异步操作完成
+
+```python
+async def func():
+    data = await func1()
+    return data
+```
+
+
+
 ### 核心函数
 
 由于Jupyter Notebook本身就是在`asyncio.run()`中，因而，在循环事件中调用回报错。只需要直接调用`await func()`即可。
@@ -100,11 +127,11 @@ class SafeBankAccount:
             
             # 读取余额
             current = self.balance
-            await asyncio.sleep(0.01)  # ❌ 这里可能被切换！
+            await asyncio.sleep(0.01) 
             
             # 计算新余额
             new_balance = current + amount
-            await asyncio.sleep(0.01)  # ❌ 这里可能又被切换！
+            await asyncio.sleep(0.01)  
             
             # 写入余额
             self.balance = new_balance
@@ -254,5 +281,107 @@ root_logger = logging.getLogger()
 for handler in root_logger.handlers[:]:  # 使用[:]创建副本
     root_logger.removeHandler(handler)
     handler.close()  # 重要：释放资源
+```
+
+## `__name__`模块
+
+```python
+if __name__ == "__main__":
+    do something....
+# 是常见的接口判断，这意味着，程序运行是由当前模块产生的。
+```
+
+name的常见用法。当`__name__`被作为模块导入时，可以识别出导入的模块，这意味着，可以区分和记录不同模块代码的调用，从而进行debug或者日志log辅助开发。
+
+example：
+
+```python
+# ./__name__test.py
+if __name__ == "__main__":
+    print("在当前函数调用")
+else:
+    print(f"在{__name__}模块中调用")    
+  
+```
+
+```python
+# 当作为模块导入时，会打印出__name__test
+# 当直接调用时，会打印 __main__
+import __name__test # 相当于cpp中的#include
+```
+
+## 上下文管理器
+
+上下文管理器是 Python 中用于**管理资源**的对象，确保资源被正确获取和释放。
+
+```python
+# 最经典的例子：文件操作
+with open('file.txt', 'r') as f:  # 进入上下文
+    content = f.read()             # 使用资源
+                                  # 离开上下文，自动关闭文件
+
+# 等价于：
+f = open('file.txt', 'r')
+try:
+    content = f.read()
+finally:
+    f.close()  # 确保文件被关闭
+```
+
+同步上下文管理器
+
+```python
+class DatabaseConnection:
+    def __init__(self, host, port, database):
+        """初始化方法：设置连接参数"""
+        self.host = host
+        self.port = port
+        self.database = database
+        self.connection = None  # 实际的连接对象，在__enter__中创建
+        print(f"初始化连接参数：{host}:{port}/{database}")
+    
+    def __enter__(self):
+        """进入上下文时调用：建立实际连接"""
+        print(f"正在连接到 {self.host}:{self.port}/{self.database}")
+        # 模拟建立连接
+        self.connection = f"Connection to {self.database}"
+        print("连接成功！")
+        return self  # 返回给 as 后面的变量
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """退出上下文时调用：关闭连接"""
+        print(f"关闭连接：{self.connection}")
+        self.connection = None
+        if exc_type:
+            print(f"发生异常：{exc_type.__name__}: {exc_val}")
+        print("连接已关闭")
+        return False  # 不抑制异常
+
+# 使用
+print("=== 开始使用数据库 ===")
+with DatabaseConnection("localhost", 5432, "mydb") as db:
+    print(f"使用连接：{db.connection}")
+    # 模拟数据库操作
+    print("执行查询...")
+    # 如果没有异常，正常退出
+print("=== 使用结束 ===")
+
+# 输出：
+# === 开始使用数据库 ===
+# 初始化连接参数：localhost:5432/mydb
+# 正在连接到 localhost:5432/mydb
+# 连接成功！
+# 使用连接：Connection to mydb
+# 执行查询...
+# 关闭连接：Connection to mydb
+# 连接已关闭
+# === 使用结束 ===
+```
+
+异步上下文管理器
+
+```python
+class AsyncDatabaseConnections:
+    async def 
 ```
 
