@@ -1541,3 +1541,327 @@ class Neo4jClient:
 neo4j_client = Neo4jClient()
 ```
 
+### 上下文记忆和语义缓存
+
+智能体的智能程度取决于其记忆力。我们需要使用Postgres来存储完整的对话历史记录，以便LLM能够回忆起5回合前说过的话。
+
+![](./Image/上下文记忆.jpg)
+
+为此，我们需要在`services/api/app/memory/models.py`中定义模式。
+
+```python
+# services/api/app/memory/models.py
+from sqlalchemy.orm import declarative_base
+from sqlalchemy import Column, Integer, String, Text, DataTime, JSON
+from datetime import datetime
+
+Base = declarative_base()
+
+class ChatHistory(Base):
+    """
+    用于 chat_history 表的SQLAlchemy模型。存储上下文原始对话日志
+    """
+    __tablename__ = "chat_history"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    
+    # 会话ID将消息连接到特定对话线程
+    session_id = Column(String(255), index=True, nullable=False)
+	
+    # 用于多租户的用户ID
+    user_id = Column(String(255), index=True, nullable=False)
+    
+    # 角色：'user','assistant' or 'system'
+    role = Column(String(50), nullable=False)
+    
+    # 实际消息内容
+    content = Column(Text, nullable=False)
+    
+    # 元数据：令牌使用情况、延迟、使用的模型版本
+    metadata_ = Column(JSON, default={}, nullable=True)
+    
+    # 时间戳
+    created_at = Column(DateTime, default=datetime.utcnow)
+```
+
+然后我们将实现 CRUD 逻辑`services/api/app/memory/postgres.py`。我们按时间倒序获取历史记录，以便将最新上下文提供给 LLM。
+
+```python
+# services/api/app/memory/postgres.py
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+from sqlalchemy.orm import sessionmaker, declarative_base
+from sqlalchemy import Column, String, JSON, DateTime, Integer, Text
+from datetime import datetime
+from services.api.app.config import settings
+
+# 1.数据库设置
+Base = declarative_base()
+
+# 2.定义聊天记录表
+class ChatHistory(Base):
+    """
+    存储每次对话回合
+    """
+    __tablename__ = "chat_history"
+    
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    session_id = Column(String, index=True) # 用户对话ID
+    user_id = Column(String, index=True)
+    role = Column(String) # 'user'or 'assistant'
+    content = Column(Text) # 文本消息
+    metadata_ = Column(JSON, default={}) #额外信息（延迟、令牌）
+    created_at = Column(DataTime, default=datetime.utcnow)
+    
+# 3.异步引擎和会话
+engine = create_async_engine(settings.DATABASE_URL, echo=False)
+AsyncSessionLocal = sessionmaker(
+	bind = engine, class_ = AsyncSession, expire_on_commit=False
+)
+
+class PostgresMemory:
+    """
+    用于持久化会话状态管理器
+    """
+    async def add_message(self, session_id: str, role: str, content: str, user_id: str):
+        async with AsyncSessionLocal() as session:
+            async with session.begin():
+                msg = ChatHistory(
+                	session_id = session_id,
+                    role = role,
+                    content = content,
+                    user_id = user_id
+                )
+                session.add(msg)
+                # 通过 async with session.begin() 自动提交
+                
+	async def get_history(self, session_id: str, limit: int=10):
+        """
+        获取上下文窗口中的最后N条消息
+        """
+        from sqlalchemy import select
+        async with AsyncSessionLoacl() as session:
+            result = await session.execute(
+            	select(ChatHistory)
+                .where(ChatHistory.session_id == session_id)
+                .order_by(ChatHistory.create_at.desc())
+                .limit(limit)
+            )
+            # 反向排序以获取时间顺序（最早 -> 最新)
+            return result.scalars().all()[::-1]
+
+postgres_memory = PostgresMemory()
+```
+
+为了节省成本，我们在系统中实现了**语义缓存**`services/api/app/cache/semantic.py`。如果一个用户问**“什么是 Kubernetes？”**，另一个用户问**“解释一下 K8s”**，则嵌入相似度会很高。
+
+> 在 70B 型号上，我们可以立即提供缓存的答案，而无需消耗 GPU 积分。
+
+```python
+# services/api/app/cache/semantic.py
+import json
+import logging
+from typing import Optional
+from services.api.app.clients.ray_embed import embed_client
+from services.api.app.client.qdrant import qdrant_client
+from services.api.app.config import settings
+
+logger = logging.getLogger(__name__)
+
+class SemanticCache:
+    """
+    使用向量搜索实现语义缓存
+    我们不进行精确的字符串匹配，而是根据语义进行匹配
+    """
+    async def get_cached_response(self, query:str, threshold: float=0.95) -> Optional[str]:
+        """
+        检查缓存中是否存在类似的查询
+        """
+        try:
+            # 1.嵌入传入的查询（快速CPU/GPU调用）
+            vector = await embed_client.embed_query(query)
+            
+            # 2.在Qdrant中的特定“缓存”集合中搜索
+            # 如果配置了Redis Vector， 则在Redis Vector中搜索
+            results = await qdrant_client.client.search(
+            	collection_name = "semantic_cache",
+                query_vector = vector,
+                limit = 1,
+                with_payload = True,
+                score_threshold = threshold # 仅搜索极其相似的查询
+            )
+			if results:
+                logger.info(f"语义缓存命中！得分{results[0].score}")
+                return results[0].payload["answer"]
+		
+        except Exception as e:
+            logger.warning(f"于一缓存查找失败{e}")
+            
+		return None
+
+    async def set_cached_response(self, query: str, answer: str):
+        """将回答保存到缓存中"""
+        try:
+            # 1.嵌入查询
+            vector = await embed_client.embed_query(query)
+            
+            # 2.保存到Vector DB
+            import uuid
+            from qdrant_client.http import models
+            
+            await qdrant_client.client.upsert(
+            	collection_name = "semantic_cache",
+                points = [
+                    moedels.PointStruct(
+                    	id = str(uuid.uuid4()),
+                        vector = vector,
+                        payload = {"query": query, "answer": answer}
+                    )
+                  
+                ]
+            )
+            
+		except Exception as e:
+            logger.warning(f"写入语义缓存失败{e}")
+
+semantic_cache = SemanticCache()
+```
+
+这肯定会降低企业环境中常见问题解答 (FAQ) 的延迟。
+
+### 使用 LangGraph 的工作流
+
+这是智能体的核心。我们将对话视为一个状态机。智能体可以在**“思考”**、**“检索”**、**“使用工具”**和**“回答”**之间转换。
+
+![](./Image/LangGraph工作流.jpg)首先，我们定义`AgentState`in `services/api/app/agents/state.py`。该字典承载着对话在图节点间流动时的上下文。
+
+```python
+# services/api/app/agents/state.py
+from typing import TypedDict, Annotated, List, Union
+import operator
+
+class AgentState(TypedDict):
+    """
+    LangGraph中节点间传递的状态对象。
+    跟踪对话历史和当前步骤数据
+    """
+    # 使用 operator.add 表示新消息追加，而不是覆盖
+    messages: Annotated[List[dict], operator.add]
+    
+    # 从RAG（向量+图）中检索的上下文
+    documents: List[str]
+        
+    # 当前处理中的问题
+    current_query: str
+        
+	# 规划器内部暂存的
+    plan: List[str]
+```
+
+规划**节点**（`services/api/app/agents/nodes/planner.py`）会查看用户查询并决定如何处理。它充当路由器的角色，将流量导向检索、工具或直接回答。
+
+```python
+# services/api/app/agents/nodes/planner.py
+import json
+import logging
+from services.api.app.agents.state import AgentState
+from services.api.app.clients.ray_llm import llm_client
+
+logger = logging.getLogger(__name__)
+
+SYSTEM_PROMPT = """
+您是 RAG 规划代理。
+分析用户查询和对话历史记录。
+决定下一步：
+1. 如果用户问候（Hello/Hi），则输出“direct_answer”。
+2. 如果用户询问需要数据的具体问题，则输出“retrieve”。
+3. 如果用户询问数学/代码，则输出“tool_use”。
+仅输出 JSON 格式：
+{ 
+    "action": "retrieve" | "direct_answer" | "tool_use", 
+    "refined_query": "独立搜索查询", 
+    "reasoning": "您选择此操作的原因" 
+} 
+"""
+```
+
+然后我们就可以简单地定义异步规划器节点……
+
+```python
+async def planner_node(state: AgentState) -> dict:
+    """
+    决定在LangGraph中的路径
+    """
+    logger.info("规划节点：正在分析查询...")
+    # 提取最新用户消息
+    # state['messages']是一个字典或对象列表
+    last_message = state["messages"][-1]
+    user_query = last_message.content if hasattr(last_message, 'content') else last_message['content']
+    
+    # 调用LLM进行规划
+    try:
+        response_text = await llm_client.chat_completion(
+        	messages = [
+                { "role" : "system" , "content" : SYSTEM_PROMPT}, 
+                { "role" : "user" , "content" : user_query} 
+            ], 
+            temperature= 0.0  # 确定性规划
+        )
+        
+        # 解析JSON
+        plan = json.loads(response_text)
+        
+        logger.ingfo(f"Plan derived: {plan['action']}")
+        
+        # 更新状态
+        return {
+             "current_query" : plan.get( "refined_query" , user_query), 
+            "plan" : [plan[ "reasoning" ]] 
+        }
+    
+     except Exception as e: 
+        logger.error( f"Planning failed: {e} " ) 
+        # 回退：假设我们需要搜索
+        return { 
+            "current_query" : user_query, 
+            "plan" : [ "Error in planning, defaulting to retrieval." ] 
+        }
+```
+
+这个节点至关重要，因为它能防止系统对简单的问候语或无关的问题进行代价高昂的搜索。
+
+我们还需要一个**检索节点**（`services/api/app/agents/nodes/retriever.py`），它将执行我们的**混合搜索**。
+
+它并行调用 Qdrant（向量）和 Neo4j（图）`asyncio.gather`，从而兼具语义检索和结构检索的优势。
+
+```python
+# services/api/app/agents/nodes/retriever.py
+import asyncio
+from typing import Dict, List
+from services.api.app.agents.state import AgentState
+from services.api.app.clients.qdrant import qdrant_client
+from services.api.app.clients.neo4j import neo4j_client
+from services.api.app.clients.ray_embed import embed_client
+import logging
+
+logger = logging.getLogger(__name__)
+async def retrieve_node(state: AgentState) -> Dict:
+    """
+    执行混合检索
+    1.嵌入用户查询
+    2.同时运行向量搜索和图搜索
+    3.合并并去重结果
+    """
+    query = state["current_query"]
+    logger.info(f"正在检索{query}的上下文")
+	
+    # 步骤1：获取查询的嵌入（调用Ray Serve）
+    # 等待此操作，需要Qdrant向量
+    query_vector = await embed_client.embed_query(query)
+    
+    # 步骤2：定义并执行任务
+    # 任务A：向量搜索
+    async def run_vector_search():
+        results = await qdrant_client.search(vector=query_vector, limit=5)
+        # 格式：“内容[来源：第一页]“
+        return [f"{r.paload['text']} [来源：{r.payload['metadata']['filename']}]" ]
+```
+
