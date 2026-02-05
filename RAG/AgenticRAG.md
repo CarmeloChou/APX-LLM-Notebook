@@ -1862,6 +1862,642 @@ async def retrieve_node(state: AgentState) -> Dict:
     async def run_vector_search():
         results = await qdrant_client.search(vector=query_vector, limit=5)
         # 格式：“内容[来源：第一页]“
-        return [f"{r.paload['text']} [来源：{r.payload['metadata']['filename']}]" ]
+        return [f"{r.paload['text']} [来源：{r.payload['metadata']['filename']}]" for r in results]
+    
+    # 任务B：图搜索（结构关系）
+    # 我们使用关键字来匹配或者预先定义编码模板
+    async def run_graph_search():
+        cypher = """
+        CALL db.index.fulltext.queryNodes("entity_index", $query) YIELD node, score
+        MATCH (node)-[r]->(neighbor)
+        RETURN node.name + ' ' + type(r) + ' ' + neighbor.name as text
+        LIMIT 5
+        """
+        # 注意：Lucene 语法的全文搜索可能需要模糊匹配 (~)。
+        try:
+            result = await neo4j_client.query(cypher, {"query": query})
+            return [r['text'] for r in results]
+        except Exception as e:
+            logger.error(f"图搜索失败: {e}")
+            return []
+        
+	# 步骤3 ：并行运行
+    vector_docs, graph_docs = await asyncio.gather(run_vector_search(), run_graphe_search())
+    
+    # 步骤4：合并和去重
+    # 我们优先考虑图结果中的特定事实，向量结果中的一般上下文。
+    combined_docs = list(set(vector_docs + graph_docs))
+    
+    logger.info(f"检索到{len(combined_docs)}个文档。")
+    
+    # 更新状态
+    return {"documents": combined_docs}
 ```
+
+响应**节点**（`services/api/app/agents/nodes/responder.py`）接收检索到的文档，并通过 Ray Serve 使用 Llama-70B 模型合成最终答案。
+
+```python
+# services/api/app/agents/nodes/responder.py
+from services.api.app.agents.state import AgentState
+from services.api.app.clients.ray_llm import llm_client
+
+async def generate_node(state: AgentState) -> dict:
+    """
+    使用检索到的文档合成最终答案
+    """
+    query = state["current_query"]
+    documents = state.get("documents", [])
+    
+    # 构建上下文字符串
+    context_str = "\n\n".join(documents)
+    
+    prompt = f"""
+    您是一位乐于助人的企业助手，请使用以下上下文回答用户的问题
+    
+    上下文：
+    {context_str}
+    
+    问题：
+    {query}
+    
+    说明：
+    1.使用[Source:Filename]引用来源。
+    2.如果答案不在上下文中，请说”我的文档中没有该信息“
+    3.请保持简洁和专业
+    """
+    
+    #调用LLM
+    answer = await llm_client.chat_completion(
+    	messages = [{"role": "user", "content": prompt}],
+        temperature = 0.3 # 低创意，高保真度
+    )
+    
+    # 返回用于更新状态的字典（添加AI信息）
+    return {
+        "messages":[{"role": "assistant", "content":answer}]
+    }
+```
+
+最后，我们将所有内容组合在一起`services/api/app/agents/graph.py`。这定义了工作流程：开始 -> 规划器 -> （检索器或工具） -> 响应器 -> 结束。
+
+```python
+# services/api/app/agents/graph.py
+from langgraph.graph import StateGraph, END
+from services.api.app.agents.state import AgentState
+from services.api.app.nodes.retriever import retrieve_node
+from services.api.app.agents.nodes.responder import generate_node
+from services.api.app.agents.nodes.planner import planner_node
+
+# 初始化图
+workflow = StateGraph(AgentState)
+
+# 1.定义节点（逻辑步骤）
+# 这些函数（上面导入的）将在下一个nodes/文件夹中实现
+workflow.add_node("planner", planner_node) # 重写查询/决定步骤
+workflow.add_node("retriever", retrieve_node) # 调用Qdrant和Neo4j
+workflow.add_node("responder", generate_node) # 调用Ray Serve LLM
+
+# 2.定义边（流程）
+# 开始->计划->检索->生成->结束
+workflow.set_entry_point("planner")
+workflow.add_edge("planner", "responder")
+workflow.add_edge("retriever", "responder")
+workflow.add_edge("responder", END) # 在更复杂的代理中，如果答案错误，我们可以循环返回
+
+# 3.编译图
+# 这将创建可运行的应用程序
+agent_app = workflow.compile()
+```
+
+### 查询增强和应用程序入口点
+
+为了提高检索准确率，我们使用了先进的 RAG 技术，其中之一是**HyDE**（假设文档嵌入），我们将在 中实现它`services/api/app/enhancers/hyde.py`。
+
+![](./Image/查询增强.jpg)
+
+> 它要求语言学习模型 (LLM) 产生一个虚假的答案，将其嵌入文本中，并用它来查找具有相似语义模式的真实文档。
+>
+> 这里应该可以自定义，还有adaptive rag等模式，可以看RAG all tech/ RAG anything
+
+```python
+# services/api/app/enhancers/hyde.py
+from services.api.app.clients.ray_llm import llm_client
+
+SYSTEM_PROMPT = """
+您是一位乐于助人的助手。
+请编写一个假设的段落来回答用户的问题。
+它不需要完全正确，但必须使用
+相关文档应有的正确词汇和结构。
+问题：{question} 
+"""
+
+async def generate_hypothetical_document(question: str) -> str:
+    """生成一个虚拟文档以改进向量相似度检索"""
+    try:
+        hypothetical_doc = await llm_client.chat_completion(
+        messages=[
+            {"role":"system", "content":SYSTEM_PROMPT.format(question=question)},
+                  ],
+              temperature = 0.7
+        )
+        return hypothetical_doc
+    except Exception:
+        return question # 回退
+        
+```
+
+我们还使用解析器解决共引用（例如， “**它多少钱？”**`services/api/app/enhancers/query_rewriter.py` ） 。这确保搜索引擎能够获得完整的查询，例如“ ***Kubernetes\*****多少钱？”**。
+
+```python
+# services/api/main.py
+from contextlib import asynccontextmanager
+from fastapi import FastAPI
+from services.api.app.clients.neo4j import neo4j_client
+from services.api.app.clients.ray_llm import embed_client
+from services.api.app.cache.redis import redis_client
+from services.api.app.routes import chat, upload, health
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """集中式资源管理，在此处初始化所有连接池
+    """
+    # 1.启动
+    print("正在初始化客户端...")
+    neo4j_client.connect()
+    await redis_client.connect()
+    await llm_client.start()
+    await embed_client.start()
+    
+    yield
+    
+    # 2.关闭
+    print("正在关闭客户端...")
+    await neo4j_client.close()
+    await redis_client.close()
+    await llm_client.close()
+    await embed_client.close()
+    
+# FastAPI应用程序
+app = FastAPI(title='企业RAG平台', version="1.0.0", lifespan=lifespan)
+
+# 包含路由
+app.include_router(chat.router, prefix="/api/v1/chat", tags=["聊天"])
+app.include_router(upload.router, prefix="/api/v1/upload", tags=["上传"])
+app.include_router(health.router, prefix="/health", tags=["健康"])
+
+if __name__ == "__main__":
+    import uvicorn
+    # 在生产环境中，此程序通过Docker中的Gunicorn/Uvicorn运行
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+```
+
+我们现在有了一个能够进行规划、检索和推理的智能体。但是，智能体系统需要与外部知识进行交互。在下一节中，我们将构建**工具和沙箱**层，使我们的智能体能够安全地执行代码并搜索网络。
+
+## 工具和沙箱
+
+在**企业级 RAG 平台**中，赋予 AI 模型直接执行代码或查询内部数据库的权限**会带来巨大的安全风险**。这样一来，黑客可以伪造 LLM 提示符，并访问关键的数据库信息。
+
+![](./Image/工具箱和沙盒.jpg)
+
+**我们需要分层策略**。我们将构建一套安全、确定性的工具，对于高风险操作（例如 Python 执行），我们将创建一个隔离的、加固的沙箱环境。
+
+### 安全代码沙箱
+
+允许逻辑逻辑模型（LLM）生成和执行Python代码功能强大，它可以解决复杂的数学问题、生成图表或分析CSV文件。但这也很危险。逻辑逻辑模型可能会产生幻觉`os.system("rm -rf /")`或试图窃取数据。
+
+![](./Image/代码沙盒.jpg)
+
+为了解决这个问题，我们构建了一个**沙箱微服务**。这是一个独立的 Docker 容器，用于运行不受信任的代码。**它没有网络访问权限，CPU/内存资源有限，并且超时时间很短**。
+
+首先，我们将编写代码`services/sandbox/Dockerfile`，创建一个非root用户来限制容器内的权限。
+
+```dockerfile
+# services/sandbox/Dockerfile
+# 1.使用最小基础镜像以减少攻击面
+FROM python:3.10-slim
+
+# 2.设置环境变量
+ENV PYTHONDONTWRITEBYTECODE=1\
+	PYTHONUBUFFERED=1
+
+# 3.创建非root用户（安全最佳实践）
+RUN useradd -m -u 1000 sandbox_user
+
+# 4.安顿依赖项
+WORKDIR /app
+COPY runner.py
+RUN pip install flask
+
+# 5.安全限制（应用于容器内部，由k8s limits.yaml 强制执行）
+# 我们限制用户进程权限
+USER sandbox_user
+
+# 7.入口
+EXPOSE 8080
+CMD ["python", "runner.py"]
+```
+
+接下来是`services/sandbox/runner.py`.这是我们简单的 Flask 服务器，它接收代码，在单独的进程中执行代码（这样如果服务器挂起，我们就可以终止它），并捕获标准输出。
+
+```python
+# services/sandbox/runner.py 
+from flask import Flask, request, jsonify 
+import sys 
+import io 
+import contextlib 
+import multiprocessing 
+
+app = Flask(__name__)
+
+def execute_code_safe(code:str, queue):
+    """
+    在单独的进程中运行代码，以允许硬超时。
+    捕获标准输出。
+    """ 
+    # 重定向标准输出以捕获 print() 语句
+    buffer = io.StringIO() 
+     try : 
+        with contextlib.redirect_stdout(buffer): 
+            # 受限的全局变量可以增加轻微的安全层。
+            exec (code, { "__builtins__" : __builtins__}, {}) 
+        queue.put({ "status" : "success" , "output" : buffer.getvalue()}) 
+    except Exception as e: 
+        queue.put({ "status" : "error" , "output" : str (e)}) 
+        
+       
+@app.route( "/execute" , methods=[ "POST" ] ) 
+def  run_code (): 
+    data = request.json 
+    code = data.get( "code" , "" ) 
+    timeout = data.get( "timeout" , 5 ) # 最大超时时间为 5 秒
+    queue = multiprocessing.Queue() 
+    p = multiprocessing.Process(target=execute_code_safe, args=(code, queue)) 
+    p.start() 
+    
+    # 阻塞直到超时
+    p.join(timeout) 
+    
+    if p.is_alive(): 
+        p.terminate() 
+        return jsonify({ "output" : "错误：执行超时。" }), 408 
+        
+    if  not queue.empty(): 
+        result = queue.get() 
+        return jsonify(result) 
+        
+    return jsonify({ "output" : "No output produced." }) 
+
+if __name__ == "__main__" : 
+    # Run on port 8080
+     app.run(host= "0.0.0.0" , port= 8080 )
+```
+
+我们在 . 中定义了资源限制`services/sandbox/limits.yaml`。这将确保即使用户运行`while True`循环或内存炸弹，也只会导致沙箱 pod 崩溃，而不会导致节点崩溃。
+
+```yaml
+# services/sandbox/limits.yaml
+
+# python代码解释器的硬性限制
+runtime:
+	# 终止信号前的最大执行实践
+	timeout_seconds: 10
+	
+	# 脚本可分配的最大内存容量
+	memory_limit_mb: 512
+	
+	# 最大CPU核心（防止加密货币挖矿循环）
+	cpu_limit: 0.5
+	
+	# 网络许可：STRICTLY DENY
+	allow_network: false
+	files:
+	# 最大输入数据
+	max_input_size_mb: 5
+	
+	# 允许的模型（白名单）-可选，代码分析处理
+	allowed_imports: ["math", "datetime", "json", "pandas", "numpy"]
+```
+
+我们同样需要在`services/sandbox/network-policy.yaml`中书写K8s网络规则。这是一个防火墙规则，禁止所有的外来访问。沙盒不能连接到互联网、数据库以及其他的服务。
+
+```yaml
+# services/sandbox/network-policy.yaml
+apiVersion: networking.k8s.io/v1
+
+kind: NetworkPolicy
+
+metadata:
+	name: sandbox-deny-egress
+	namespace: default
+	
+spec:
+	podSelector:
+		matchLabels:
+			app: sanbox-service
+	policyTypes:
+	
+	- Egress
+	
+	# 默认禁止所有外来访问
+	# 沙盒不能向外调用互联网以及任何服务
+	egress: []
+```
+
+最终，这个API接口需要一个代理来和沙盒通信。`services/api/app/tools/sanbox.py`处理这个给内部沙盒服务发送HTTP请求。
+
+```python
+# services/api/app/tools/sandbox.py
+import httpx
+from services.api.app.config import settings
+
+# 帮助在k8s中查找沙盒服务
+SANDBOX_URL = "http://sandbox-service:8080/execute"
+
+async def run_python_code(code:str) -> str:
+    """
+    工具：python解释器
+    在安全、隔离的沙盒环境中运行python代码
+    """
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+            	SANDBOX_URL,
+                json={"code":code, "timeout":5},
+                timeout=6.0
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                if data.get("status") == "success":
+                    return f"Output:\n{data['output']}"
+                else:
+                    return f"Execution Error:\n{data['output']}"
+			else:
+                return f"Sandbox Error: Status {response.status_code}"
+	
+    except Exception as e:
+        return f"Sandbox Connection Failed: {str(e)}"
+```
+
+### 固定工具及搜索工具
+
+代码执行存在风险，因此我们尽可能选择更安全、确定性的工具。对于数学运算，我们在 `services/api/app/tools/calculator.py`使用`simpleeval`。它会解析表达式并进行计算，而无需使用 ` `eval()`.`
+
+![](./Image/搜索工具.png)
+
+```python
+# services/api/app/tools/calculator.py
+from simpleeval import simple_eval
+
+def calculate(expression: str) -> str:
+    """
+    使用simpleeval安全地计算数学表达式。
+    防止远程代码执行（RCE）。
+    """
+    # 1.长度限制，防止ReDoS攻击或内存耗尽
+    if len(expression) > 100:
+        return "错误：表达式过长。"
+    try:
+        # simple_eval解析抽象语法树（AST），并且只允许使用数学运算符。
+        # 它无法访问全局变量、内置函数或操作系统/系统模块
+        result = simple_eval(expression)
+        return str(result)
+    
+    except Exception as e:
+        return f"错误：{str(e)}"
+```
+
+为了检索知识，我们将图数据库和向量数据库作为工具公开，`services/api/app/tools/graph_search.py`使代理能够查询 Neo4j。
+
+> 请注意，我们首先使用 LLM 提取*实体*，然后运行固定的 Cypher 查询。
+
+我们**绝不**让LLM直接编写原始Cypher查询，以防止注入攻击。
+
+```python
+# services/api/app/tools/graph_search.py
+from services.api.app.clients.neo4j import neo4j_client
+from services.api.app.clients.ray_llm import llm_client
+import json
+
+SYSTEM_PROMPT = """
+你是知识图谱助手。请从用户的问题中提取核心主题以执行搜索。
+问题：{question}
+仅输出JSON:{"entities":["list", "of", "names"]}
+"""
+```
+
+然后我们可以定义我们的`graph_tool`异步方法……
+
+```python
+async def search_graph_tool(question: str) -> str:
+    """通过提取实体安全地搜索图"""
+    try:
+        response_text = await llm_client.chat_completion(
+        	messages=[{"role":"system", "content": SYSTEM_PROMPT.format(question=question)}],
+            temperature= 0.0, 
+            json_mode= True
+        )
+        data = json.loads(response_text)
+        entities = data.get("entities", [])
+        
+        # 执行参数化查询（安全）
+        cypher_query = """
+        UNWIND $names AS target_name
+        CALL db.index.fulltext.queryNodes("entity_index", target_name) YIELD node, score
+        MATCH(node)-[r]-(neighbor)
+        RETURN node.name AS source, type(r) AS rel, neighbor.name AS target
+        LIMIT 10
+        """
+        results = await neo4j_client.query(cypher_query, {"names": entities})
+        return str(results) if results else "未找到连接"
+    except Exception as e:
+        return f"图搜索错误：{str(e)}"
+    
+```
+
+同样，我们需要编写代码`services/api/app/tools/vector_search.py`来暴露 Qdrant 端口。当规划器判断用户想要**“查找文档”**而不是**“回答问题”**时，这将非常有用。
+
+```python
+# services/api/app/tools/vector_search.py
+from services.api.app.clients.qdrant import qdrant_client
+from services.api.app.clients.ray_embed import embed_client
+
+async def search_vector_tool(query: str) -> str:
+    """工具：在向量数据库中搜索文档"""
+    try:
+        vector = await embed_client.embed_query(query)
+        results = await qdrant_client.search(vector, limit=3)
+    	fomatted = ""
+        for r in results:
+            meta = r.payload.get("metadata", {})
+            formatted += f"-{r.payload.get("text", "")[:200]} ... [Source: {meta.get("filename")}]\n"
+		return formatted if formatted else "未找到相关文档。"
+    except Exception  as e:
+        return f"搜索错误：{str(e)}"
+```
+
+为了获取外部信息，我们添加了此功能`services/api/app/tools/web_search.py`。它使用类似 Tavily（针对代理商优化）的 API 来获取实时信息。您可以使用任何其他您选择的提供商，但 Tavily 的可靠性高且价格实惠。
+
+```python
+# services/api/app/tools/web_search.py
+import httpx
+import os
+
+async def web_search_tool(query: str) -> str:
+    """工具：搜索互联网"""
+    api_key = os.getenv("TAVILY_API_KEY")
+    
+    if not api_key: return "网络搜索已禁用"
+    
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+            	"https://api.tavily.com/search",
+                json = {"api_key", "query", "max_results", 3}
+            )
+            
+            data = response.json()
+            results = data.get("results", [])
+            return "\n".join([f"- {r["title"]} : {r["content"]}" for r in results] )
+
+	except Exception as e:
+        return f"Web search Error: {str(e)}"
+```
+
+### API路由和网关逻辑
+
+工具准备就绪后，我们需要通过 REST 端点公开系统。`services/api/app/routes/chat.py`这是主要入口点。
+
+![](./Image/路由逻辑.png)
+
+```python
+# services/api/app/routes/chat.py
+import uuid
+import json
+import logging
+from typing import AsyncGenerator
+from fastapi import APIRouter, Depends, BackgroundTasks
+from fastapi.responses import StreamingResponse
+from services.api.app.auth.jwt import get_current_user
+from services.api.app.agents.graph import agent_app
+from services.api.app.agents.state import AgentState
+from services.api.app.memory.postgres import postgres_memory
+from services.api.app.cache.semantic import semantic_cache
+
+router = APIRouter()
+logger = logging.getLogger(__name__)
+
+class ChatRequest(BaseModel):
+    message: str
+    session_id: str = None
+
+@router.post("/stream")
+async def chat_stream(req: ChatRequest, background_tasks: BackgroundTasks, user: dict = Depends(get_current_user)):
+    """主聊天端点（流式传输）。协调缓存->历史记录->代理"""
+    session_id = req.session_id or str(uuid.uuid4())
+    user_id = user["id"]
+    
+    # 1. 检查缓存
+    cached_ans = await semantic_cache.get_cached_response(req.message) 
+    if cached_ans: 
+        async  def  stream_cache (): 
+            yield json.dumps({ "type" : "answer" , "content" : cached_ans}) + "\n" 
+        return StreamingResponse(stream_cache(), media_type= "application/x-ndjson" ) 
+
+    # 2. 加载历史
+    history_objs = await postgres_memory.get_history(session_id, limit= 6 ) 
+    history_dicts = [{ "role" : msg.role, "content" : msg.content} for msg in history_objs] 
+    history_dicts.append({ "role" : "user" , "content" : req.message}) 
+
+    # 3.初始化代理状态
+    initial_state = AgentState(messages=history_dicts, current_query=req.message, documents=[], plan=[]) 
+    async  def  event_generator (): 
+        final_answer = "" 
+        async  for event in agent_app.astream(initial_state): 
+            node_name = list (event.keys())[ 0 ] 
+            node_data = event[node_name] 
+            
+            # 发送状态更新
+            yield json.dumps({ "type" : "status" , "node" : node_name}) + "\n" 
+            if node_name == "responder"  and  "messages"  in node_data: 
+                final_answer = node_data[ "messages" ][- 1 ][ "content" ] 
+                yield json.dumps({ "type" : "answer" , "content" : final_answer}) + "\n" 
+        
+        # 后台：保存到数据库和缓存
+        if final_answer: 
+            await postgres_memory.add_message(session_id, "user" , req.message, user_id) 
+            await postgres_memory.add_message(session_id, "assistant" , final_answer, user_id) 
+            await semantic_cache.set_cached_response(req.message, final_answer) 
+```
+
+类似地，我们也可以创建健康监测功能……
+
+```python
+# services/api/app/routes/health.py
+@router.get("/readiness")
+async def readiness(response: Response):
+    """
+    K8s就绪探测
+    检查与关键依赖项（Redis、数据库）的连接
+    如果失败，K8s将停止向此Pod发送流量
+    """
+    status_report = {"redis": "down", "neo4j": "down"}
+    is_healthy = True
+    
+    # 1.检查Redis
+    try:
+        r = redis_client.get_client()
+        if await r.ping():
+            status_report["redis"] = "up"
+	except Exception:
+        is_healthy = False
+        
+	# 2.检查Neo4j（仅连接性）
+    try:
+        # 驱动程序是单例，检查是否已初始化
+        if neo4j_client._driver:
+            status_report["neo4j"] = "up"
+		else:
+            is_healthy = False
+	except Exception:
+        is_healthy = False
+
+	if not is_healthy:
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+
+	return status_report
+```
+
+最后，**保护我们的 API 免受滥用至关重要**。我们在网关层使用速率限制来实现这一功能`services/gateway/rate_limit.lua`。该机制运行在 Nginx 或 Kong 中，通过检查 Redis 来确保用户没有发送垃圾请求。
+
+```lua
+# services/gateway/rate_limit.lua
+local redis = require "resty.redis"
+local red = redis:new()
+
+red:set_timeout(100)
+
+local ok, err = red:connect("rag-redis-prod", 6379)
+
+if not ok then return ngx.exit(500) end
+local key = "rate_limit:" ..ngx.var.remote_addr
+
+local limit = 100
+
+local current = red:incr(key)
+
+if current == 1 then red:expire(key, 60) end
+
+if current > limit then
+    ngx.status = 429
+    ngx.say("速率限制已超出")
+    return ngx.exit(429)
+e
+```
+
+
+
+
+
+
 
