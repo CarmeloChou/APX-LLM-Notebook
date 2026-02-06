@@ -2492,12 +2492,105 @@ if current > limit then
     ngx.status = 429
     ngx.say("速率限制已超出")
     return ngx.exit(429)
-e
+end
 ```
 
+> 通过将此逻辑移至 Lua/Nginx，我们可以在不良流量到达我们的 Python API*之前*将其拦截，从而节省宝贵的 CPU 周期。
 
+我们现在已经构建了整个应用栈：数据摄取、模型、代理和工具。下一节中，我们将配置基础设施，以便在 AWS 上运行这个庞大的系统。
 
+## 基础设施即代码（IaC）
 
+软件栈搭建完毕后，我们需要一个运行它的地方。在**企业级 RAG 平台**中，你不能仅仅在 AWS 控制台中点击按钮。那样会导致**“点击操作”的**偏离、安全漏洞以及环境的不可复现性。
 
+![](./Image/基础设施.jpg)
 
+1. 我们使用**Terraform**将整个云环境以代码形式定义。这使我们能够在几分钟内快速启动完全相同的本地`dev`、本地`staging`和本地`prod`环境。
+2. 我们还使用**Karpenter**进行智能的、即时的节点扩展，这比标准的 AWS 自动扩展组更快、更便宜。
+
+### 基础设施与网络
+
+所有云架构都始于网络。我们需要一个虚拟私有云 (VPC)，它将我们的敏感数据库与公共互联网隔离，同时允许我们的 API 处理流量。
+
+![](./Image/网络.jpg)
+
+首先，我们开始构建`infra/terraform/main.tf`。我们将配置远程状态后端。这对于团队协作至关重要：如果没有它，两位工程师`terraform apply`同时操作可能会导致基础架构状态损坏。我们将状态文件存储在带有 DynamoDB 锁定的版本化 S3 存储桶中。
+
+```bash
+# infra/terraform/main.tf
+terraform{
+	required_version = ">=1.5.0"
+	
+	backend "s3" {
+		bucket = "rag-platform-terraform-state-prod-001"
+		key = "platform/terraform.tfstate"
+		region = "us-east-1"
+		encrypto = true
+		dynamodb_table = "terraform-state-lock"
+	}
+	
+    required_providers {
+        aws = { source = "hashicorp/aws", version = "~> 5.0"}
+        kubernetes = { source = "hashicorp/kubernetes", version = "~> 2.23"}
+    }
+}
+
+provider "aws" {
+	region = var.aws_region
+	default_tags {
+		tags = { Project = "Enterprise-RAG", ManagedBy = "Terraform"}
+	}
+}
+```
+
+这里我们主要初始化 AWS 和 Kubernetes 提供商。该`backend "s3"`代码块确保我们基础设施的**敏感数据**存储在云端，经过加密和锁定，而不是存储在开发人员的笔记本电脑上。
+
+我们在 . 中定义了可自定义的参数`infra/terraform/variables.tf`。这提高了可重用性，我们可以简单地通过覆盖这些变量来部署`us-west-2`或更改 IP 范围，而无需触及复杂的逻辑文件。
+
+```bash
+# infra/terraform/variables.tf
+variable "aws_region" {
+	description = "AWS region to deploy resources"
+	default = "us-east-1"
+}
+
+variable "cluster_name" {
+	description = "Name of the EKS Cluster"
+	default = "rag-platform-cluter"
+}
+
+variable "vpc_cidr" {
+	description = "CIDR block for the VPC"
+	default = "10.0.0.0/16"
+}
+```
+
+此文件负责定义我们各个模块所需的输入。它充当我们基础设施模块的 API，定义了适用于大多数情况的默认值，同时也允许进行自定义。
+
+现在，`infra/terraform/vpc.tf`我们需要构建一个三层网络架构。这可以从物理上将负载均衡器（公有网络）与应用服务器（私有网络）和数据存储（数据库）隔离开来，从而大幅减少攻击面。
+
+```bash
+# infra/terraform/vpc.tf
+module "vpc" {
+  source  = "terraform-aws-modules/vpc/aws"
+  version = "5.1.0"
+
+name = "${var.cluster_name}-vpc"
+
+  cidr = var.vpc_cidr
+
+  azs             = ["us-east-1a", "us-east-1b", "us-east-1c"]
+  public_subnets  = ["10.0.1.0/24", "10.0.2.0/24", "10.0.3.0/24"]
+  private_subnets = ["10.0.101.0/24", "10.0.102.0/24", "10.0.103.0/24"]
+  database_subnets= ["10.0.201.0/24", "10.0.202.0/24", "10.0.203.0/24"]
+
+  enable_nat_gateway = true
+  single_nat_gateway = false # High Availability requires one NAT per AZ
+  enable_dns_hostnames = true
+
+  # Tags are required for Kubernetes Load Balancers to auto-discover subnets
+  public_subnet_tags = { "kubernetes.io/role/elb" = "1" }
+  private_subnet_tags = { "kubernetes.io/role/internal-elb" = "1" }
+}
+```
 
