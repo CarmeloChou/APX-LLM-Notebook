@@ -2594,3 +2594,471 @@ name = "${var.cluster_name}-vpc"
 }
 ```
 
+在这里，我设置了`enable_nat_gateway = true`允许我们的私有应用程序 Pod 从互联网安全地下载 Docker 镜像和 Python 包，而无需将它们暴露给外部连接。这些标签至关重要：如果没有它们，Kubernetes 中的 AWS 负载均衡控制器将不知道将 ALB 部署在哪里。
+
+### 计算集群（EKS 和 IAM）
+
+我们平台的云通信部分采用的是**Amazon EKS**（弹性 Kubernetes 服务）集群。我们正在部署控制平面来协调所有容器。此设置需要具备安全性和细粒度的权限管理能力。
+
+![](./Image/计算集群.jpg)在此版本中`infra/terraform/eks.tf`，我们启用了 OIDC（OpenID Connect）。该连接允许 Kubernetes 服务账户承担 AWS IAM 角色（IRSA)。这消除了对长期有效的 AWS 访问密钥的需求，从而避免了企业环境中的一项重大安全风险。
+
+```bash
+# infra/terraform/eks.tf
+module "eks" {
+	source = "terraform-aws-modules/eks/aws"
+	version = "~> 19.0"
+	
+}
+
+cluster_name = var.cluster_name
+cluter_version = "1.29"
+vpc_id = module.vpc.vpc_id
+subnet_ids = module.vpc.private_subnets
+enable_irsa = true
+
+# 我们只定义最小系统节点组
+# 应用扩张在后续Karpenter中处理
+eks_managed_node_groups = {
+	system = {
+		name   			= "system-nodes"
+		instance_types 	= ["m6i.large"]
+		min_size		= 2
+		max_size 		= 5
+		desired_size	= 2
+	}
+}
+```
+
+此模块配置 EKS 控制平面和一个小型**“系统”**节点组。我们保持此节点组规模较小，因为它仅负责运行系统关键型 Pod，例如 CoreDNS 和 Karpenter。繁重的计算任务将由稍后动态创建的节点完成。
+
+接下来，我们将编写代码`infra/terraform/iam.tf`来实现摄取管道的**最小权限原则。**
+
+我们创建了一个特定的 IAM 策略，该策略*仅*授予对文档存储桶的访问权限，并将其绑定到摄取作业使用的特定 Kubernetes 服务帐户。
+
+```bash
+# infra/terraform/iam.tf
+resource "aws_iam_policy" "ingestion_policy" {
+  name        = "RAG_Ingestion_S3_Policy"
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = ["s3:GetObject", "s3:PutObject", "s3:ListBucket"]
+        Effect   = "Allow"
+        Resource = [aws_s3_bucket.documents.arn, "${aws_s3_bucket.documents.arn}/*"]
+      }
+    ]
+  })
+}
+
+module "ingestion_irsa_role" {
+  source    = "terraform-aws-modules/iam/aws//modules/iam-role-for-service-account-eks"
+  role_name = "rag-ingestion-role"
+  
+  oidc_providers = {
+    main = {
+      provider_arn               = module.eks.oidc_provider_arn
+      namespace_service_accounts = ["default:ray-worker"]
+    }
+  }
+  role_policy_arns = { policy = aws_iam_policy.ingestion_policy.arn }
+}
+```
+
+> 这样可以确保，即使我们的 Ray Worker 遭到入侵，攻击者也无法访问我们 AWS 账户的其他部分，例如数据库备份或账单信息。
+
+### 托管数据存储
+
+在 Kubernetes 内部运行有状态数据库在运维上既复杂又有风险。
+
+> 对于生产级系统，我们使用 AWS 托管服务来自动处理备份、修补和故障转移。
+
+![](./Image/数据存储管理.jpg)
+
+我们通过部署**Aurora Serverless v2**（Postgres）来实现`infra/terraform/rds.tf`这一点。这对于像与 RAG 聊天这样的可变工作负载至关重要。它可以根据活跃连接数自动扩展或缩减计算容量（ACU），从而确保高峰时段的高性能和低谷时段的低成本。
+
+```bash
+# infra/terraform/rds.tf
+module "aurora" {
+  source  = "terraform-aws-modules/rds-aurora/aws"
+  name           = "${var.cluster_name}-postgres"
+  engine         = "aurora-postgresql"
+  instance_class = "db.serverless" 
+  
+  instances = {
+    one = {}
+    two = {} # HA Multi-AZ
+  }
+
+serverlessv2_scaling_configuration = {
+    min_capacity = 2
+    max_capacity = 64
+  }
+  vpc_id               = module.vpc.vpc_id
+  db_subnet_group_name = module.vpc.database_subnet_group_name
+  
+  # Only allow traffic from within the VPC
+  security_group_rules = {
+    vpc_ingress = { cidr_blocks = [module.vpc.vpc_cidr_block] }
+  }
+}
+```
+
+这`serverlessv2_scaling_configuration`使得数据库能够从 2 个 ACU（便宜）无缝扩展到 64 个 ACU（强大），而不会断开连接。
+
+为了实现高速缓存，我们需要编写代码并在其中使用**ElastiCache（Redis）**`infra/terraform/redis.tf`。
+
+我们特意选择了`cache.t4g.medium`这些实例。这些实例运行在 AWS Graviton (ARM) 处理器上，与标准 x86 实例相比，性价比最高可提升 40%。
+
+```bash
+# infra/terraform/redis.tf
+ resource "aws_elasticache_replication_group"  "redis" { 
+  replication_group_id = "rag-redis-prod"
+   description = "用于 RAG 语义缓存的 Redis"
+   node_type = "cache.t4g.medium"
+   num_cache_clusters = 2 # 主节点 + 副本节点
+  port = 6379 
+  
+  subnet_group_name = aws_elasticache_subnet_group.redis_subnet.name 
+  security_group_ids = [aws_security_group.redis_sg.id] 
+  
+  at_rest_encryption_enabled = true
+   transit_encryption_enabled = true
+ }
+```
+
+我们需要配置一个包含两个节点的复制组，以确保高可用性。**如果主节点发生故障，AWS 会自动将副本提升为主节点，从而保持缓存在线**。
+
+我们将创建一个空间来存放原始文件。它会`infra/terraform/s3.tf`设置一个**启用传输加速功能**的 S3 存储桶。全球企业的用户遍布各地，传输加速功能利用 Amazon CloudFront 全球分布式边缘节点，通过优化的 AWS 主干网络将上传文件路由到存储桶，从而显著加快大文件传输速度。
+
+```bash
+# infra/terraform/s3.tf
+resource "aws_s3_bucket" "documents" {
+  bucket = "rag-platform-documents-prod"
+}
+
+resource "aws_s3_bucket_accelerate_configuration" "docs_accel" {
+  bucket = aws_s3_bucket.documents.id
+  status = "Enabled"
+}
+
+resource "aws_s3_bucket_lifecycle_configuration" "docs_lifecycle" {
+  bucket = aws_s3_bucket.documents.id
+  rule {
+    id     = "archive-old-files"
+    status = "Enabled"
+    transition {
+      days          = 30
+      storage_class = "INTELLIGENT_TIERING" # Auto-optimizes cost
+    }
+  }
+}
+```
+
+30 天后，系统`lifecycle_configuration`会自动将旧文件移至更便宜的存储类别（如 Glacier），这是控制长期存储成本的标准 FinOps 做法。
+
+由于我们选择在 Kubernetes 上自托管 Neo4j（为了节省与 AuraDB Enterprise 相比的许可成本），因此我们在 . 中定义了其安全组`infra/terraform/neo4j.tf`。我们需要严格控制对这些 pod 的网络访问。
+
+```bash
+# infra/terraform/neo4j.tf
+resource "aws_security_group" "neo4j_sg" {
+  name        = "neo4j-access-sg"
+  vpc_id      = module.vpc.vpc_id
+
+ingress {
+    description = "Internal Bolt Protocol"
+    from_port   = 7687
+    to_port     = 7687
+    protocol    = "tcp"
+    cidr_blocks = [module.vpc.vpc_cidr_block]
+  }
+}
+```
+
+此安全组充当防火墙，仅允许来自我们 VPC 内部的流量访问 Neo4j Bolt 端口。外部互联网流量将被完全阻止。
+
+最后，`infra/terraform/outputs.tf`导出我们刚刚创建的端点。Terraform 模块类似于函数，这些输出是返回值，我们可以轻松查询这些值，以便在下一阶段配置 Kubernetes Secrets。
+
+```bash
+# infra/terraform/neo4j.tf
+resource "aws_security_group" "neo4j_sg" {
+  name        = "neo4j-access-sg"
+  vpc_id      = module.vpc.vpc_id
+
+ingress {
+    description = "Internal Bolt Protocol"
+    from_port   = 7687
+    to_port     = 7687
+    protocol    = "tcp"
+    cidr_blocks = [module.vpc.vpc_cidr_block]
+  }
+}
+```
+
+此安全组充当防火墙，仅允许来自我们 VPC 内部的流量访问 Neo4j Bolt 端口。外部互联网流量将被完全阻止。
+
+最后，`infra/terraform/outputs.tf`导出我们刚刚创建的端点。Terraform 模块类似于函数，这些输出是返回值，我们可以轻松查询这些值，以便在下一阶段配置 Kubernetes Secrets。
+
+```bash
+# infra/terraform/outputs.tf
+output "aurora_db_endpoint" {
+  value = module.aurora.cluster_endpoint
+}
+
+output "redis_primary_endpoint" {
+  value = aws_elasticache_replication_group.redis.primary_endpoint_address
+}
+output "s3_bucket_name" {
+  value = aws_s3_bucket.documents.id
+}
+```
+
+### 使用 Karpenter 实现自动扩缩容
+
+标准集群自动扩缩容机制反应迟缓，需要等待 Pod 调度失败后才会添加节点。而**Karpenter**则更加主动智能，它会分析待调度 Pod 的具体资源需求（例如 GPU 类型、内存），并在几秒钟内启动最合适的 EC2 实例。
+
+![](./Karpenter自动缩放.jpg)
+
+我们在配置文件中定义了 CPU 资源分配器`infra/karpenter/provisioner-cpu.yaml`。对于我们的无状态 API 和 Web 服务器，我们可以容忍中断，因此我们使用**竞价型实例**。与按需实例相比，这可以为我们节省大约 70% 的计算成本。
+
+```yaml
+# infra/karpenter/provisioner-cpu.yaml
+apiVersion: karpenter.sh/v1beta1
+kind: Provisioner
+metadata:
+  name: cpu-provisioner
+spec:
+  requirements:
+    - key: "karpenter.k8s.aws/instance-family"
+      operator: In
+      values: ["m6i", "c6i"]
+    - key: "karpenter.sh/capacity-type"
+      operator: In
+      values: ["spot"] # Cost optimization
+  limits:
+    resources:
+      cpu: 1000
+  consolidation:
+    enabled: true # Repacks pods to kill empty nodes
+```
+
+该`consolidation: true`设置指示 Karpenter 主动移动 pod，以更紧密地排列节点并终止未充分利用的实例，从而确保我们不会为空置空间付费。
+
+对于我们的人工智能工作负载，我们进行了定义`infra/karpenter/provisioner-gpu.yaml`。成本控制的关键就在这里。我们设置了生存时间 (TTL) 参数。
+
+```yaml
+# infra/karpenter/provisioner-gpu.yaml
+apiVersion: karpenter.sh/v1beta1
+kind: Provisioner
+metadata:
+  name: gpu-provisioner
+spec:
+  requirements:
+    - key: "karpenter.k8s.aws/instance-category"
+      operator: In
+      values: ["g"] # g5 instances (Nvidia A10G)
+    - key: "karpenter.sh/capacity-type"
+      operator: In
+      values: ["on-demand", "spot"]
+  
+  # Kill the node if it's empty for 30 seconds
+  ttlSecondsAfterEmpty: 30
+```
+
+## 部署
+
+**在生产级 RAG 平台**中，部署不仅仅是`kubectl apply -f file.yaml`。
+
+> 我们需要管理配置偏差，安全地处理密钥，并确保我们的数据库能够抵御故障。
+
+![](./Image/部署层.jpg)
+
+我们使用**Helm**来打包应用程序。Helm 允许我们将部署定义为模板，这样就可以轻松地**针对不同的环境更改值（例如副本数或存储大小），而无需重写数千行 YAML 代码**。
+
+### 集群引导和密钥
+
+在部署自定义代码之前，我们需要安装集群。这包括入口控制器（流量控制）、外部密钥操作员（安全卫士）和 KubeRay 操作员（AI 管理器）。
+
+![](./Image/集群引导.jpg)
+
+我们使用 Helm 脚本来实现自动化`scripts/bootstrap_cluster.sh`。该脚本会为这些关键系统组件安装 Helm Chart。
+
+```sh
+# scripts/bootstrap_cluster.sh 
+#!/bin/bash 
+
+# 1. 安装 KubeRay Operator（管理 Ray 集群）
+helm repo add kuberay https://ray-project.github.io/kuberay-helm/ 
+helm install kuberay-operator kuberay/kuberay-operator --version 1.0.0 
+
+# 2. 安装外部密钥（同步 AWS Secrets Manager 到 Kubernetes）
+helm repo add external-secrets https://charts.external-secrets.io 
+helm install external-secrets external-secrets/external-secrets 
+
+# 3. 安装 Nginx Ingress（负载均衡控制器）
+helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx 
+helm install ingress-nginx ingress-nginx/ingress-nginx
+```
+
+在尝试部署应用程序之前，我们要确保集群中所有必要的控制器都在运行。这相当于我们平台的**“预检”**。
+
+接下来，为了处理密钥。在生产环境中，我们绝不会提交`.env`文件。我们使用 AWS Secrets Manager 来存储数据库密码和 API 密钥。我们使用**External Secrets Operator**来获取这些密钥，并将它们安全地注入到 Kubernetes Pod 中。
+
+我们在以下地方定义了这一点`deploy/secrets/external-secrets.yaml`。
+
+```yaml
+# deploy/secrets/external-secrets.yaml 
+apiVersion:  external-secrets.io/v1beta1 
+kind:  ExternalSecret 
+metadata: 
+  name:  app-secrets 
+spec: 
+  refreshInterval:  1h              # 每小时检查一次轮换
+  secretStoreRef: 
+    name:  aws-secrets-manager      # 连接到 AWS 
+    kind:  ClusterSecretStore 
+  target: 
+    name:  app-env-secret           # 创建一个名为“app-env-secret”的 Kubernetes Secret 
+  data: 
+  -  secretKey:  NEO4J_PASSWORD 
+    remoteRef: 
+      key:  prod/rag/db_creds       # AWS Secret 名称
+      property:  neo4j_password
+```
+
+此配置告诉 Kubernetes：“前往 AWS Secrets Manager，查找`prod/rag/db_creds`并获取`neo4j_password`，并为我的 Pod 创建一个本地 Kubernetes Secret”。**这样可以将我们的敏感数据完全排除在 Git 历史记录之外。**
+
+### 数据库和入口部署
+
+现在我们部署有状态工作负载。虽然我们使用 RDS 来托管 Postgres，但出于性能和成本方面的考虑，我们选择自行托管 Qdrant 和 Neo4j。
+
+![](./Image/数据库和入口.jpg)
+
+我们使用标准的 Helm Chart，但会覆盖默认值以使其适用于生产环境。对于 Qdrant，我们将进行修改，`deploy/helm/qdrant/values.yaml`以确保数据持久化和高可用性。
+
+```yaml
+# deploy/helm/qdrant/values.yaml 
+
+# 集群模式：运行 3 个副本以实现容错
+replicaCount:  3 
+
+config: 
+  storage: 
+    # 使用 Memmap 进行存储（将向量存储在磁盘上，但映射到 RAM）
+    # 允许处理大于 RAM 的数据集。
+    on_disk_payload:  true 
+  
+  service: 
+    enable_tls:  false  # TLS 由 Ingress/Mesh 处理
+
+resources: 
+  requests: 
+    cpu:  "2" 
+    memory:  "4Gi" 
+  limits: 
+    cpu:  "4" 
+    memory:  "8Gi" 
+
+# 持久化：使用快速 SSD（io1 或 gp3）
+persistence: 
+  size:  50Gi 
+  storageClassName:  gp3
+```
+
+使用`replicaCount: 3`此功能是为了在某个节点发生故障时，我们的 Vector DB 仍能保持在线。`on_disk_payload`这是 RAG 的一项关键优化，它可以防止 Qdrant 在索引数百万个文档（超出 RAM 限制）时崩溃。
+
+对于 Neo4j，我们需要配置类似的结构`deploy/helm/neo4j/values.yaml`。
+
+```yaml
+# deploy/helm/neo4j/values.yaml 
+
+neo4j: 
+  name:  "neo4j-cluster" 
+  edition:  "community" 
+  
+  core: 
+    # 社区版不支持集群。
+    # 必须为 1。如果需要高可用性，请升级到企业版。
+    numberOfServers:  1  
+    
+    resources: 
+      requests: 
+        cpu:  "2" 
+        memory:  "8Gi" 
+    
+  volumes: 
+    data: 
+      mode:  "default"  # 动态绑定
+      storageClassName:  "gp3" 
+      size:  "100Gi"
+```
+
+我们分配了内存（`8Gi`），因为图遍历会消耗大量内存。我们还附加了一个**100GB 的持久卷，以确保我们的知识图谱**在 Pod 重启后仍然有效。
+
+为了将我们的 API 暴露给互联网，我们在 . 中配置了一个 Ingress 资源`deploy/ingress/nginx.yaml`。它充当我们的 API 网关，将来自 AWS 负载均衡器的 HTTP 流量路由到我们的内部服务。
+
+```yaml
+# deploy/ingress/nginx.yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: rag-ingress
+  annotations:
+    # Use AWS Load Balancer Controller
+    kubernetes.io/ingress.class: nginx
+
+    # Increase body size limit just in case (though we use S3 direct upload)
+    nginx.ingress.kubernetes.io/proxy-body-size: "50m"
+
+    # Timeout settings for streaming responses
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+spec:
+  rules:
+  - host: api.your-rag-platform.com
+    http:
+      paths:
+
+      # Route /chat to the API
+      - path: /chat
+        pathType: Prefix
+        backend:
+          service:
+            name: api-service
+            port:
+              number: 80
+
+      # Route /upload to the API (for presigned generation)
+      - path: /upload
+        pathType: Prefix
+        backend:
+          service:
+            name: api-service
+            port:
+              number: 80
+```
+
+这里的注解很重要。`proxy-read-timeout`**设置为 1 小时是因为生成包含 70 字节模型的长答案有时需要** **时间**，我们不希望 Nginx 过早断开连接。
+
+### Ray AI 集群部署
+
+最后，我们部署了运营的核心——Ray集群。这很复杂，因为它包含一个**头节点（管理节点）**和**多个工作节点（执行节点）**，这些节点需要独立扩展。
+
+![](./Image/Ray集群部署.jpg)
+
+首先，我们在 . 中定义扩展逻辑`deploy/ray/autoscaling.yaml`。此配置映射告诉 Ray Autoscaler 当负载增加时要添加多少个工作进程。
+
+```yaml
+# deploy/ray/autoscaling.yaml 
+autoscaling: 
+  enabled:  true 
+  upscaling_speed:  1.0  # 激进的扩容
+  idle_timeout_minutes:  5  # 如果工作节点空闲 5 分钟则终止
+  
+  worker_nodes: 
+    gpu_worker_group: 
+      min_workers:  0 
+      max_workers:  20 
+      resources: { "CPU":  4 , "memory":  32Gi , "GPU":  1 }
+```
+
