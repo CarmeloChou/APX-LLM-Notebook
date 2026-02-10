@@ -3062,3 +3062,741 @@ autoscaling:
       resources: { "CPU":  4 , "memory":  32Gi , "GPU":  1 }
 ```
 
+此配置适用于**归零模式**……
+
+> 如果 5 分钟内无人使用 AI 模型，Ray 会终止工作 Pod。Karpenter 随后会检测空节点并终止 EC2 实例，从而节省大量资金。
+
+我们在 . 中定义集群结构`deploy/ray/ray-cluster.yaml`。这是一个由 KubeRay 操作员管理的自定义资源定义 (CRD)。
+
+```yaml
+# deploy/ray/ray-cluster.yaml 
+apiVersion:  ray.io/v1 
+
+kind:  RayCluster 
+
+metadata: 
+  name:  rag-ray-cluster 
+
+spec: 
+  rayVersion:  '2.9.0' 
+
+  headGroupSpec: 
+    serviceType:  ClusterIP 
+
+    template: 
+      spec: 
+        containers: 
+        -  name:  ray-head 
+          image:  rayproject/ray:2.9.0-py310-gpu 
+          resources: { requests: { cpu:  "2" , memory:  "8Gi" } } 
+
+workerGroupSpecs: 
+
+  # 用于推理的 GPU 工作进程
+  -  groupName:  gpu-workers 
+    replicas:  0 
+    minReplicas:  0 
+    maxReplicas:  20 
+
+    template: 
+      spec: 
+        containers: 
+        -  name:  ray-worker 
+          image:  rayproject/ray:2.9.0-py310-gpu 
+
+          resources: 
+            limits: { nvidia.com/gpu:  1 } 
+            requests: { nvidia.com/gpu:  1 } 
+
+        # 污点容忍度确保这些 pod仅允许在 GPU 节点上进行访问
+        ：
+        -  key:  "nvidia.com/gpu" 
+          operator:  "exist"
+```
+
+该`tolerations`部分确保我们昂贵的 AI 工作负载仅在具有 GPU 的节点上调度，与我们之前在 Karpenter 配置中设置的 Taints 相匹配。
+
+现在我们使用 . 将实际模型部署到此集群上`RayService`。这种抽象方式可以处理我们模型的高可用性和零停机时间升级。
+
+对于嵌入模型，我们需要创建`deploy/ray/ray-serve-embed.yaml`以便在集群上提供嵌入模型服务。
+
+```yaml
+# deploy/ray/ray-serve-embed.yaml 
+apiVersion:  ray.io/v1 
+
+kind:  RayService 
+
+metadata: 
+  name:  embed-service 
+
+spec: 
+  serveConfigV2:  | 
+    applications: 
+      - name: bge-m3 
+        import_path: services.api.app.models.embedding_engine:app 
+        deployments: 
+          - name: EmbedDeployment 
+            autoscaling_config: 
+              min_replicas: 1 
+              max_replicas: 5 
+            ray_actor_options: 
+              num_gpus: 0.5 # 共享 GPU（每张卡 2 个模型）
+```
+
+而我们需要创建的 LLM`deploy/ray/ray-serve-llm.yaml`将使用 VLLM 为 Meta Llama 3 模型提供服务，以实现高效推理。
+
+```yaml
+# deploy/ray/ray-serve-llm.yaml 
+apiVersion:  ray.io/v1 
+
+kind:  RayService 
+
+metadata: 
+  name:  llm-service 
+
+spec: 
+  serveConfigV2:  | 
+    applications: 
+      - name: llama3 
+        import_path: services.api.app.models.vllm_engine:app 
+        runtime_env: 
+          pip: ["vllm==0.3.0"] 
+          env_vars: 
+            MODEL_ID: "meta-llama/Meta-Llama-3-70B-Instruct" 
+        deployments: 
+          - name: VLLMDeployment 
+            autoscaling_config: 
+              min_replicas: 1 
+              max_replicas: 10 
+            ray_actor_options: 
+              num_gpus: 1
+```
+
+通过将这些定义为`RayService`对象，我们便能掌控运维能力。如果我们更新了这些对象`MODEL_ID`，运维人员将使用新模型启动新的 Pod，等待它们恢复正常运行，然后无缝切换流量，确保用户零停机时间。
+
+最后，当我们完成测试或需要在开发环境中节省成本时，我们也必须`scripts/cleanup.sh`通过拆除所有内容来节省成本。
+
+```sh
+# scripts/cleanup.sh 
+# !/bin/bash 
+
+echo  "⚠️警告：此操作将销毁所有云资源⚠️" 
+echo  "包括：EKS 集群、数据库（RDS/Neo4j/Redis）、S3 存储桶、负载均衡器。" 
+echo  "开发/测试环境的成本节约措施。" 
+echo  "" 
+read -p "确定吗？输入“DESTROY”：" confirm 
+
+if [ " $confirm " != "DESTROY" ]; then 
+    echo  "已中止。" 
+    exit 1 
+fi 
+
+echo  "🔹 1. 删除 Kubernetes 资源 (Helm)...."
+ helm uninstall api || true
+ helm uninstall qdrant || true
+ helm uninstall ray-cluster || true
+ kubectl delete -f deploy/ray/ || true 
+
+echo  "🔹 2. 等待负载均衡器清理..." 
+sleep 20 
+
+echo  "🔹 3. 运行 Terraform Destroy..." 
+cd infra/terraform 
+terraform destroy -auto-approve 
+
+echo  "✅ 所有资源已销毁。"
+```
+
+这个脚本是一个安全阀。它确保我们不会意外地让一个包含 20 个 GPU 节点的集群在周末运行，从而产生巨额账单。
+
+**我们结合使用了 Terraform、Helm 和 Ray，实现了对基础设施的全面控制，**同时自动化了分布式系统的复杂性。现在，我们将探讨如何在生产环境中监控和评估这一架构。
+
+## 评估与运营
+
+在**企业级红黄绿灯平台**中，评估至关重要，而且大多数评估工作都在开发阶段进行。我们需要制定一套策略，涵盖**可观测性**（指标/追踪）、**评估**（准确性检查）和**运维**（负载测试/维护）。
+
+> 在生产系统中，我们看到的评价通常是用户对答案的点赞/踩。
+
+虽然这种反馈很有用，但往往过于零散和滞后，无法在问题影响众多用户之前发现问题。
+
+### 可观测性和可追踪性
+
+**无法衡量的东西就无法改进**。在涉及 Ray、Kubernetes 和多个数据库的分布式系统中，如果没有分布式追踪，就无法找到瓶颈。
+
+![](./Image/追踪逻辑.jpg)
+
+可观测性也是一种评估方式。因为它能帮助我们了解系统性能和用户行为，所以当令牌使用量超出预算或延迟峰值出现时，可能会对我们的预算和用户满意度造成影响。
+
+我们在 . 中定义了自定义指标`libs/observability/metrics.py`。我们将使用 Prometheus 计数器来跟踪代币使用情况（成本），并使用直方图来跟踪延迟（性能）。
+
+```python
+# lib/observability/metrices/py
+from prometheus_client import Counter, Histogram
+
+# 1.计数器：只递增（例如，请求总数）
+REQUEST_COUNT = Counter(
+	"rag_api_requests_total",
+    "请求总数",
+    ["method", "endpoint", "status"]
+)
+
+# 2.直方图跟踪分布（例如，延迟、Token 计数）
+ REQUEST_LATENCY = Histogram( 
+    "rag_api_latency_seconds" , 
+    "请求延迟" , 
+    [ "endpoint" ] 
+) 
+
+TOKEN_USAGE = Counter( 
+    "rag_llm_tokens_total" , 
+    "LLM Token 消耗总数" , 
+    [ "model" , "type" ] # type=prompt vs completion
+ ) 
+
+def track_request (method: str , endpoint: str , status: int): 
+    """用于递增请求计数器的辅助函数"""
+     REQUEST_COUNT.labels(method=method, endpoint=endpoint, status=status).inc()
+```
+
+这使我们能够构建 Grafana 仪表板，准确地显示 Llama-3 消耗的令牌数量，并确定特定端点是否变慢。
+
+为了进行追踪，我们将创建`libs/observability/tracing.py`。我们使用**OpenTelemetry**，它允许我们可视化从 API 到向量搜索再到 LLM 生成的完整请求生命周期。
+
+```python
+# libs/observability/tracing.py 
+from opentelemetry import trace 
+from opentelemetry.sdk.trace import TracerProvider 
+from opentelemetry.sdk.trace.export import BatchSpanProcessor, ConsoleSpanExporter 
+
+def configure_tracing (service_name: str): 
+    """
+    设置 OpenTelemetry 追踪。
+    """ 
+    # 1. 创建追踪器提供程序
+    provider = TracerProvider() 
+    
+    # 2. 配置导出器
+    # 开发环境：打印到控制台。
+    # 生产环境：发送到 OTLP 收集器（例如 Jaeger/Grafana）
+     processor = BatchSpanProcessor(ConsoleSpanExporter()) 
+    provider.add_span_processor(processor) 
+    
+    # 3. 设置全局追踪器
+    trace.set_tracer_provider(provider) 
+    
+    return trace.get_tracer(service_name)
+```
+
+当用户报告**“响应缓慢”**时，我们可以查看跟踪 ID，例如，**可以看到 90% 的时间都花在了等待 Neo4j 图查询上**，从而准确地找出需要优化的地方。
+
+### 持续评估流程
+
+我们如何确定 RAG 流程的准确性？我们不可能手动检查每个答案。我们使用**“LLM-as-a-Judge”**来实现自动化质量控制。
+
+按回车键或点击查看完整尺寸的图片
+
+![](./Image/持续评估.jpg)
+
+首先，我们需要一个**“黄金数据集”，**即一组问题及其对应的真实答案。我们根据项目初期参考的`eval/datasets/golden.json`Kubernetes 文档（例如`pods_autoscale.html`）创建该数据集。
+
+```json
+// eval/datasets/golden.json 
+[ 
+  { 
+    "question" :  "解释水平 Pod 自动扩缩器 (HPA) 和集群自动扩缩器之间的区别。" , 
+    "ground_truth" :  "HPA 根据 CPU/指标扩展 Pod 数量。集群自动扩缩器在 Pod 无法调度时扩展节点数量。" , 
+    "contexts" :  [ 
+      "水平 Pod 自动扩缩器是 Kubernetes 的一个组件，用于调整副本数量……" , 
+      "集群自动扩缩器是一个自动调整 Kubernetes 集群大小的工具……" 
+    ] 
+  }
+   ... 
+]
+```
+
+此文件用作我们的基准测试。每次更新提示或检索逻辑时，我们都会使用此数据集运行系统。
+
+1. 通常，黄金数据集是通过更大型的线性模型或人工标注合成生成的。为了简化操作，我们使用 Gemini（谷歌最新的模型）构建了该数据集。
+2. 在处理私有数据时，我们会创建一个子流水线来生成黄金数据集。具体做法是，调用强大的逻辑生命周期管理（LLM）工具读取私有文档并生成问答对。这样，我们就能避免将敏感数据暴露给第三方服务。
+
+为了对结果进行评分，我们将编写判断逻辑`eval/judges/llm_judge.py`。该脚本将使用强大的模型（例如 GPT-4 或 Llama-3-70B）将我们系统的实际答案与真实答案进行比较。
+
+```python
+# eval/judges/llm_judge.py 
+from pydantic import BaseModel 
+from services.api.app.clients.ray_llm import llm_client 
+
+class Grade(BaseModel): 
+    score: int
+    reasoning: str
+
+JUDGE_PROMPT = """
+您是一位公正的评委，正在评估一个 RAG 系统。
+您将收到一个问题、一个标准答案和系统的答案。
+请根据 1 到 5 的等级对系统的答案进行评分：
+1：完全错误或完全错误。3 
+：部分正确，但缺少关键细节。5 
+：完美、全面，并且与标准答案的逻辑完全一致。
+仅输出 JSON：{{"score": int, "reasoning": "string"}}
+问题：{question}
+标准答案：{ground_truth}
+系统答案：{system_answer} 
+""" 
+
+async def grade_answer(question: str, ground_truth: str , system_answer: str ) -> Grade: 
+    """
+    调用 LLM 对单个 QA 进行评分
+    """
+    import json
+    
+    try:
+        response_text = await llm_client.chat_completion(
+            messages=[{"role": "user", "content": JUDGE_PROMPT.format(
+                question=question,
+                ground_truth=ground_truth,
+                system_answer=system_answer
+            )}],
+            temperature=0.0
+        )
+        
+        # Parse JSON output
+        data = json.loads(response_text)
+        return Grade(**data)
+        
+    except Exception as e:
+        return Grade(score=0, reasoning=f"Judge Error: {e}")
+```
+
+**我们使用Ragas**来协调整个过程，Ragas 是一个用于评估 RAG 系统的常用框架。主要的评估脚本将位于`eval/ragas/run.py`.
+
+**Ragas 是一个行业标准框架，它计算忠实度（人工智能是否产生了幻觉？）和上下文召回率（我们是否找到了正确的文档？）等指标**。
+
+让我们来实施这个……
+
+```python
+# eval/ragas/run.py 
+from ragas import evaluate 
+from ragas.metrics import faithfulness, answer_relevancy 
+from datasets import Dataset 
+
+def  run_evaluation(questions, answers, contexts, ground_truths ): 
+    """
+    运行 Ragas 评估套件。
+    """
+
+     data = { 
+        "question" : questions, 
+        "answer" : answers, 
+        "contexts" : contexts, 
+        "ground_truth" : ground_truths 
+    } 
+
+    dataset = Dataset.from_dict(data) 
+
+    results = evaluate( 
+        dataset=dataset, 
+        metrics=[faithfulness, answer_relevancy], 
+    ) 
+    
+    df = results.to_pandas() 
+
+    df.to_csv( "eval/reports/evaluation_results.csv" , index= False ) 
+
+    print (results)
+```
+
+该脚本将生成一份报告，`eval/reports/evaluation_results.csv`其中提供了我们管道准确性的可视化摘要。
+
+> 我们在 CI/CD 流水线中使用此功能：如果“忠实度”得分低于 0.8，我们将阻止部署。
+
+### 卓越运营与维护
+
+最后，我们需要一些工具来维护生产环境中的系统。代码变更、负载增加和数据漂移都是不可避免的。
+
+![](./Image/维护部署.jpg)
+
+为了确保我们的 Karpenter 自动扩缩容设置正常工作，我们使用 Locust 模拟高**流量**`scripts/load_test.py`。
+
+```python
+# scripts/load_test.py
+from locust import HttpUser, task, between
+import os
+
+class RAGUser(HttpUser):
+    # Wait 1 to 5 seconds between tasks
+    wait_time = between(1, 5)
+    
+    @task
+    def chat_stream_task(self):
+        """
+        Simulates a user sending a chat message.
+        """
+        headers = {
+            "Authorization": f"Bearer {os.getenv('AUTH_TOKEN')}" # Load token from env
+        }
+        
+        # Example query
+        payload = {
+            "message": "What is the warranty policy for the new X1 processor?",
+            "session_id": "loadtest-user-123"
+        }
+        
+        # Use streaming=True to handle the SSE response
+        with self.client.post(
+            "/api/v1/chat/stream", 
+            json=payload, 
+            headers=headers, 
+            stream=True,
+            name="/chat/stream" # Group results under this name
+        ) as response:
+
+            if response.status_code != 200:
+                response.failure("Failed request")
+            else:
+                # Iterate through the stream to simulate a real client
+                for line in response.iter_lines():
+                    if line:
+                        pass # In a real test, you might validate the JSON
+                response.success()
+```
+
+运行此脚本有助于我们调整`ray/autoscaling.yaml`配置，确保**当 100 个用户同时加入时，新的 GPU 节点能够足够快地启动**。
+
+随着应用程序的演进，数据库架构也会随之改变。我们需要创建`scripts/migrate_db.py`（封装）机制来安全地处理架构迁移，避免停机。
+
+```python
+# scripts/migrate_db.py 
+import subprocess 
+import os 
+from services.api.app.config import settings 
+
+def  run_migrations(): 
+    """
+    将 Alembic 迁移应用到数据库。
+    """ 
+    print("正在运行数据库迁移..." ) 
+    
+    # Alembic 需要数据库 URL。我们通过环境变量传递它。
+    env = os.environ.copy() 
+    env[ "DATABASE_URL" ] = settings.DATABASE_URL 
+    
+    try : 
+        # 'alembic upgrade head' 命令应用所有待处理的迁移。
+         subprocess.run( 
+            [ "alembic" , "upgrade" , "head" ], 
+            check= True , 
+            env=env, 
+            cwd=os.path.dirname(os.path.abspath(__file__)) # 从此脚本目录运行
+        ) 
+        print ( "✅ 迁移已成功应用。" ) 
+    except subprocess.CalledProcessError as e: 
+        print ( f"❌ 迁移失败：{e} " ) 
+        exit( 1 ) 
+
+if __name__ == "__main__" : 
+    run_migrations()
+```
+
+最后，当我们部署新版本时，缓存是空的，这会导致前几个用户响应速度较慢。我们通常会`scripts/warmup_cache.py`在将流量切换到新 Pod 之前，预先在 Redis 和 Qdrant 中填充常用查询。
+
+```python
+# scripts/warmup_cache.py 
+import asyncio 
+from services.api.app.cache.semantic import semantic_cache 
+
+# 常见问题解答列表
+FAQ = [ 
+    ( "你们的营业时间是什么？" , "我们的营业时间是上午 9 点到下午 5 点。" ), 
+    ("退货政策是什么？" , "30 天内可退货。" )
+] 
+
+async  def  warmup (): 
+    print ( "🔥 正在预热语义缓存..." ) 
+    for question, answer in FAQ: 
+        await semantic_cache.set_cached_response(question, answer) 
+    print ( "✅ 缓存预热完成。" ) 
+
+if __name__ == "__main__" : 
+    asyncio.run(warmup())
+```
+
+这些常见问题解答源自我们的黄金数据集和真实用户查询。通过将它们预加载到缓存中，我们确保最常见问题能够立即得到解答，从而在部署后立即提升用户体验。
+
+## 端到端执行
+
+我们已经编写了代码，定义了基础设施，并搭建了评估流程。现在，我们需要实际**部署**所有内容，以便运行我们的 RAG 平台。
+
+> 虽然 Terraform 可以自动完成大部分繁重的工作，但我们仍需要在 AWS 控制台中执行一些初始的手动步骤来引导我们的“远程状态”后端。这是一次性设置。
+
+我们需要创建一个 S3 存储桶来存储 Terraform 状态文件，并创建一个 DynamoDB 表来处理状态锁定（以防止并发修改）。
+
+1. 您可以根据需要为存储桶分配多个规则，例如版本控制、加密和生命周期策略，以优化成本。请务必选择区域`us-east-1`（弗吉尼亚北部），因为 EKS 在该区域拥有最丰富的 GPU 实例类型。
+2. 类似地，我们需要创建一个`DynamoDB`用于状态锁定的表，因为这对于防止多人同时应用更改至关重要。
+
+我们需要将分区键设置为`LockID`类型为 `<type>` 的键`String`。其余设置可以保留默认值。您可以给表起一个类似 `<name>` 的名称`terraform-state-lock`，并确保它与 S3 存储桶位于同一区域，以获得最佳性能。
+
+### 创建 EKS 集群
+
+现在我们的 Terraform 后端已经准备就绪。我们需要切换到终端。我们将创建 VPC、EKS 集群控制平面和数据库。
+
+> **注意：**此步骤会创建 EKS*控制平面*和一个用于运行系统工具的小型“系统节点组”（包含 2 个小型 CPU）。**它不会立即创建 GPU 节点。**为了节省成本，我们仅在软件实际需要时才创建 GPU 节点。
+
+运行基础设施构建命令，它将负责初始化和应用 Terraform 代码。
+
+```bash
+# From the root of the project
+make infra
+```
+
+该命令`terraform init`随后运行`terraform apply`
+
+```bash
+#### OUTPUT ######
+Initializing the backend...
+Successfully configured the backend "s3"!
+
+Terraform will perform the following actions:
+  # module.vpc.aws_vpc.this will be created
+  + resource "aws_vpc" "this" {
+      + cidr_block = "10.0.0.0/16"
+      + tags       = { "Name" = "rag-platform-cluster-vpc" }
+      ...
+    }
+  # module.eks.aws_eks_cluster.this will be created
+  + resource "aws_eks_cluster" "this" {
+      + name     = "rag-platform-cluster"
+      ...
+    }
+Plan: 48 to add, 0 to change, 0 to destroy.
+
+Do you want to perform these actions?
+  Enter a value: yes
+
+aws_s3_bucket.documents: Creating...
+module.vpc.aws_nat_gateway.this[0]: Creating...
+module.eks.aws_eks_cluster.this: Creating...
+module.aurora.aws_rds_cluster.this: Creating...
+
+Apply complete! Resources: 48 added, 0 changed, 0 destroyed.
+```
+
+接下来为我们分配资源
+
+```bash
+Outputs:
+aurora_db_endpoint = "rag-platform-cluster-postgres.cluster-c8s7d6f5.us-east-1.rds.amazonaws.com"
+redis_primary_endpoint = "rag-redis-prod.ng.0001.use1.cache.amazonaws.com"
+s3_bucket_name = "rag-platform-documents-prod"
+```
+
+你可以发现输出中少量资源被创建了，包括VPC、EKS集群、RDS Postgres以及ElastiCache Redis。
+
+这个过程通常需要15-20分钟。一旦完成，我们获得了一个准备就绪的K8s集群
+
+现在我们配置 `kubectl` 与我们的新集群交互并且安装系统控制器。
+
+```bash
+# Update kubeconfig to point to the new cluster
+aws eks update-kubeconfig --region us-east-1 --name rag-platform-cluster
+
+# Run bootstrap script
+./scripts/bootstrap_cluster.sh
+
+# Run bootstrap script
+./scripts/bootstrap_cluster.sh
+```
+
+我们将得到
+
+```bash
+#### OUTPUT ######
+"kuberay" has been added to your repositories
+Release "kuberay-operator" does not exist. Installing it now.
+NAME: kuberay-operator
+STATUS: deployed
+
+Release "external-secrets" does not exist. Installing it now.
+NAME: external-secrets
+STATUS: deployed
+
+Release "ingress-nginx" does not exist. Installing it now.
+NAME: ingress-nginx
+STATUS: deployed
+```
+
+您可以看到 KubeRay Operator、External Secrets Operator 和 Nginx Ingress Controller 已成功安装。
+
+目前，我们的集群已经安装完毕，但**GPU实例数为零**。
+
+接下来，我们需要**Karpenter**来管理 GPU 节点的动态配置。我们应用之前定义的 Karpenter 配置。
+
+Ray 配置明确要求`nvidia.com/gpu: 1`。
+
+1. Kubernetes 会尝试调度该 Pod。
+2. 它将失败（待定），因为我们没有 GPU 节点。
+3. **Karpenter**将检测到此待处理的 pod。
+4. Karpenter 将自动调用 AWS EC2 API 来购买`g5.xlarge`实例。
+
+```bash
+# 应用 Ray 集群和 Ray 服务定义
+kubectl apply -f deploy/ray/
+```
+
+仔细观察
+
+```bash
+kubectl get pods -w 
+
+# 初始输出：
+名称 就绪 状态 重启次数 运行时间
+rag-ray-cluster-head-8k2j1 0/1 待处理 0 5s <-- 等待节点ray 
+-worker-gpu-group-0 0/1 待处理 0 5s <-- 等待GPU节点
+```
+
+> *此时此刻，如果您查看 AWS EC2 控制台，您会看到一个名为“*`*karpenter-rag-platform-cluster-...*`*正在初始化”的新实例。我们没有点击“创建实例”，是软件自动创建的。*
+
+我等了大约**45 秒***……*然后 pod 的状态就变成了 Running：
+
+```bash
+rag - ray - cluster - head - 8 k2j1           1/1运行中0 45秒ray - worker - gpu - group - 0 0/1     容器创建中0 50秒ray - worker - gpu - group - 0 1/1运行中0 95秒                  
+```
+
+Karpenter 已成功及时创建/更新了所需的基础设施。`vLLM`工作进程内的引擎现在正在将 Llama-3-70B 权重（约 40GB 量化后）加载到新创建实例的显存中。
+
+### 推理和延迟测试
+
+如果你还记得第一部分的内容，我们准备了 1000 份文档（很多无关信息）。我们将把它们上传到 S3 并触发 Ray 作业。如果当前集群过于繁忙，该作业会启动*额外的*CPU 节点，这一切都得益于我们的 Karpenter 架构。
+
+```bash
+# 上传数据（使用 Terraform 输出中的存储桶名称）
+ python scripts/bulk_upload_s3.py ./data rag-platform-documents-prod 
+
+# 触发数据摄取作业
+python -m pipelines.jobs.s3_event_handler
+```
+
+这将触发文档上传、嵌入和分块创建知识图谱的摄取任务。
+
+```bash
+### 输出 ###
+作业提交 ID：ray_job_ingest_1000_docs 
+
+
+（Ray 数据）2025-12-28 10:00:01 -- 执行 DAG InputDataBuffer[Input] -> TaskPoolMapOperator[ParsePDF] -> TaskPoolMapOperator[Embed] 
+
+（Ray 数据）2025-12-28 10:00:05 -- 阶段 1 (ReadS3)：找到 1000/1000 个文件。
+
+（Ray 数据）2025-12-28 10:00:45 -- 阶段 2 (Parse)：100%|██████████| 1000/1000 [00:40<00:00, 25.00 个文档/秒] 
+
+(Ray 数据) 2025-12-28 10:01:10 -- 阶段 3 (嵌入): 100%|██████████| 5000/5000 个数据块 [00:25<00:00, 200.00 个数据块/秒] 
+
+(Ray 数据) 2025-12-28 10:01:15 -- 阶段 4 (WriteQdrant): 已插入 5000 个向量。
+
+(Ray 数据) 2025-12-28 10:01:20 -- 阶段 5 (WriteNeo4j): 已合并 1200 个节点和 3500 个关系。... 
+
+[已截断]
+
+作​​业“ray_job_ingest_1000_docs”成功。
+```
+
+请注意吞吐量。由于 Ray 将 PDF 解析并行化到多个 CPU 核心，并将嵌入批量处理到 GPU，我们在不到 2 分钟的时间内处理了 1000 份企业文档。
+
+现在知识图谱和向量数据库已经填充完毕，让我们提出一个需要智能体“规划”的复杂问题。
+
+```bash
+#获取负载均衡器 URL kubectl 
+get ingress 
+# 输出：api.your-rag-platform.com 
+
+# Curl 请求
+curl -X POST  https://api.your-rag-platform.com/api/v1/chat/stream \   -H "Content-Type: application/json " \   -d '{     " message " : "根据文档比较 Kubernetes中HPA与VPA的成本。",     " session_id ": " demo-session- 1 "   }'
+```
+
+通过查看控制台输出，我们可以看到整个 rag 处理流程的工作原理……
+
+```bash
+#### RAG 流水线输出 #####
+
+ { "type" : "status" , "node" : "planner" , "info" : "Intent: Retrieve" } 
+{ "type" : "status" , "node" : "retriever" , "info" : "Searching Qdrant & Neo4j..." } 
+... 
+{ "type" : "status" , "node" : "retriever" , "info" : "Found 5 related chunks." } 
+{ "type" : "answer" , "content" : "Based on the provided documentation:" } 
+... 
+{ "type" : "answer" , "content" : "The **Horizo​​ntal Pod Autoscaler (HPA)** scales the number of Pod in a replication controller, deployment, replica set, or stateful set based on observations CPU utilization or other selected metrics." } 
+{ "type" : "answer" , "content" : " HPA 本身不产生直接成本，但它通过扩展 Pod 来增加云成本，这可能会触发集群自动扩缩器添加新节点。" } 
+{ "type" : "answer" , "content" : " 相比之下，**垂直 Pod 自动扩缩器 (VPA)** 会根据使用情况自动调整 Pod 的 CPU 和内存请求/限制。" } 
+... 
+{ "type" : "answer" , "content" : " VPA 优化现有资源，并通过合理调整容器大小来降低成本，确保您不会过度配置资源。" } 
+{ "type" : "answer" , "content" : " **主要成本差异**：HPA 通过增加容量（节点/Pod）来增加成本，而 VPA 通过调整资源效率来优化成本。" } 
+{ "type" : "answer" , "content" : " [来源：pods_autoscale.html]" } 
+... 
+{ "type" : "status" , "node" : "responder" , "info" : "Streaming Complete" }
+```
+
+您可以看到，代理首先识别出意图为“检索”。然后，它在 Qdrant 和 Neo4j 中执行混合搜索，找到相关文档，并综合生成带有引用的全面答案。
+
+**虽然答案质量很重要，但在企业环境中，延迟直接关系到用户体验。如果用户需要盯着一个旋转的加载图标看10秒钟，他们就会离开。**
+
+我们来看一下刚刚运行的 HPA 与 VPA 查询的内部延迟细分情况。由于我们启用了结构化日志记录，因此可以准确地看到时间都消耗在了哪里。
+
+```bash
+### 输出 ###
+ { 
+  "request_id":  "req-a1b2-c3d4" , 
+  "total_latency_ms":  2850 , 
+  "breakdown": { 
+    "planner_node_ms":  420 , 
+    "retrieval_node_ms":  780 , 
+    "generation_ttft_ms":  1650 
+   } 
+}
+```
+
+我们通常会在 2-4 秒内收到响应。以下是这种架构能够实现如此高速度的原因：
+
+1. **并行检索：**耗时`retrieval_node_ms`780 毫秒。这包括*向量*搜索（Qdrant）和图查询（Neo4j）。由于我们`asyncio.gather`在 API 代码中使用了并行处理，这些查询在不同的 CPU 线程上同时运行。如果按顺序运行，仅此步骤就需要 1.5 秒。
+2. **vLLM 加速：**首次词元到达时间`generation_ttft_ms`(Time To First Token) 为 1.6 秒。这是 70B 模型读取上下文并开始说话所需的时间。标准的 HuggingFace 流水线在此处需要 4-5 秒。vLLM 的**PagedAttention**优化了内存访问，从而将这一时间缩短。
+
+但是，随着我们添加更多代理，例如“代码审查员”或“网络搜索员”，这种延迟自然会增加。
+
+> 如果我们简单地将它们串联起来，响应时间可能会超过 10 秒。
+
+为了解决这个问题，我们将进一步**分散网络**。不再让一个代理循环在单个 CPU 上运行，而是生成多个 Ray Actor 并行运行不同的代理，即使复杂度增加，也能保持约 3 秒的运行时间。
+
+### Redis 和 Grafana 仪表盘分析
+
+最后，我们可以验证系统在高负载下的表现。我们运行 Locust 负载测试，模拟 500 个并发用户带来的流量高峰。
+
+```bash
+locust -f scripts/load_test.py --headless -u 500 -r 10 --host https://api.your-rag-platform.com
+```
+
+![](./Image/Ray表盘.png)
+
+从 Ray Dashboard 的峰值可以看出，我们导入的 1000 个文档已经使 GPU 达到满负荷运行。自动扩缩器检测到负载增加，并请求更多 GPU 节点（最多 3 个）。
+
+本次测试中，我们将最大 GPU 节点数设置为 3 个（总共 16 个 GPU），CPU 核心数设置为 192 个。这足以处理 500 个并发用户，延迟较低，但显然可以根据您的预算和预期负载进行调整。
+
+![](./Image/Grafana仪表盘.jpg)
+
+当我们访问 Grafana 控制面板时，可以看到请求延迟最初飙升至 5 秒，但随着新节点上线，延迟稳定在 1.2 秒左右。
+
+自动扩缩容日志显示了以下内容……
+
+```bash
+### 自动扩缩容日志 ###
+ [自动扩缩容日志]
+
+已触发扩容：待处理任务数 > 100。
+
+当前节点：1 个 (g5.xlarge)。
+
+目标节点：3 个 (g5.xlarge)。
+
+正在通过 Karpenter 启动 3 个新节点...
+```
+
+我们看到 GPU 利用率飙升。Ray 自动扩缩器立即检测到队列深度增加，并请求增加 2 个 GPU 节点。Karpenter 立即响应了这一请求。90 秒内，集群容量翻倍，请求延迟也趋于稳定。
+
+它可以处理嘈杂的数据，高效地进行处理，并能自动扩展以满足用户需求，并在用户离开时缩减至零。
