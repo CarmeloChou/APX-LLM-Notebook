@@ -63,7 +63,7 @@ del2:                        # 第9行
 	echo "has deleted test2.txt" # 第11行
 ```
 
-其中`.PHONY`指伪目标内容，它包含本次makefile中的所有指令名称，执行`del2`时，并没有一个del2的文件，所以每次执行make del2，都会执行上述命令。**PHONY的作用就是将del2视为规则而不是文件。**
+其中`.PHONY`指伪目标内容，它包含本次makefile中的所有指令名称，执行`del2`时，并没有一个del2的文件，所以每次执行make del2，都会执行上述命令。如果手动创建一个 del2文件，那么make del2就不会执行了，**PHONY的作用就是将del2视为规则而不是文件。**
 
 一般来说，并不需要用`.PHONY`标识`clean`等约定俗成的伪目标名称，除非有人故意搞破坏，手动创建名字叫`clean`的文件。
 
