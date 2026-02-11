@@ -46,7 +46,7 @@ print("✅ summarizer_agent created.")
 
 根agent
 
-```pyhton
+```python
 # Root Coordinator: Orchestrates the workflow by calling the sub-agents as tools.
 root_agent = Agent(
     name="ResearchCoordinator",
