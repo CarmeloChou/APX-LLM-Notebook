@@ -385,3 +385,25 @@ class AsyncDatabaseConnections:
     async def 
 ```
 
+## Pydantic
+
+**Pydantic** 是一个 Python 数据验证和设置管理库，**用类型注解来验证数据**。
+
+```python
+from pydantic import BaseModel
+
+class User(BaseModel):
+    name: str
+    age: int
+    email: str | None = None
+
+# 自动验证
+user = User(name="张三", age=25)  # ✅
+user = User(name="李四", age="二十五")  # ❌ 自动报错：age 不是整数
+
+user = User(name="王五", age="30")  # ✅ 字符串"30"自动转成整数30
+
+print(User.schema_json(indent=2))
+# 输出标准的 JSON Schema，可供API文档使用
+```
+
