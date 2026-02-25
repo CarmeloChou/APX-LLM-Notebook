@@ -2,6 +2,28 @@
 
 ## lambda表达式
 
+cpp11引入的匿名函数对象
+
+```cpp
+[捕获列表](参数列表) -> 返回类型 {
+    函数体
+}
+
+// 定义一个lambda并立即调用
+[]() {
+    std::cout << "Hello Lambda!" << std::endl;
+}();  // 注意最后的()表示立即调用
+
+// 或者赋值给变量
+auto sayHello = []() {
+    std::cout << "Hello Lambda!" << std::endl;
+};
+sayHello();  // 调用
+
+```
+
+
+
 ```c++
 // 传统写法
 auto lambda = [](int x) {
