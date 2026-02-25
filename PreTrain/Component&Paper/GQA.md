@@ -110,53 +110,90 @@ k_expand(:, 1::2, ...) = k
 ```
 
 ```cpp
-# include <iostream>
-class Tensor{
-    private:
-    float gradiant;
-    float value;
-    vector<Tensor*> cache;
-    void (Tensor::* backward)();
-    public:
-    Tensor(float v, float g):value(v), gradiant(g), cache(), backward(nullptr) {}
+#include <vector>
+#include <algorithm>
+#include <unordered_set>
+using namespace std;
+
+class Tensor {
+private:
+    float grad;
+    float val;
+    vector<Tensor*> prev;  // 前驱节点
+    // 更好的设计：使用std::function或虚函数
+    function<void()> backward_func;
     
-    ~Tensor(){
+public:
+    Tensor(float v = 0, float g = 0) : val(v), grad(g), backward_func(nullptr) {}
+    
+    // 加法
+    Tensor* operator+(Tensor& other) {
+        Tensor* out = new Tensor(val + other.val, 0);
+        out->prev.push_back(this);
+        out->prev.push_back(&other);
         
-    }
-    
-    void Add(){
-        for(auto input : *cache){
-            input->gradiant += gradiant;
-        }
-    }
-    void Mul(){
-        *cache[0]->gradiant += gradiant * (*cache[1]->value);
-        *cache[1]->gradiant += gradiant * (*cache[0]->value);     
-    }
-    
-    Tensor* Div(){
-        return *cache[0] * (*cache[1])**-1
-    }
-    
-   Tensor* operator+(Tensor& a, Tensor& b){
-       Tensor* out = new Tensor();
-       out->value = a.value + b.value;
-       out->cache.push_back(&a);
-       out->cache.push_back(&b);
-       
-       out->backward = &Tensor::Add;
-       return out;
-   }
-    
-    Tensor* operator*(Tensor&a, Tensor&b){
-        Tensor* out = new Tensor();
-        out->val = a.value * b.value;
-        out->cache.push_backe(&b);
-        out->backward = &Tensor::Mul;
+        out->backward_func = [out]() {
+            if (out->prev.size() >= 2) {
+                out->prev[0]->grad += out->grad * 1.0f;  // ∂(a+b)/∂a = 1
+                out->prev[1]->grad += out->grad * 1.0f;  // ∂(a+b)/∂b = 1
+            }
+        };
         return out;
     }
     
-}
+    // 乘法
+    Tensor* operator*(Tensor& other) {
+        Tensor* out = new Tensor(val * other.val, 0);
+        out->prev.push_back(this);
+        out->prev.push_back(&other);
+        
+        out->backward_func = [out]() {
+            if (out->prev.size() >= 2) {
+                out->prev[0]->grad += out->grad * out->prev[1]->val;  // ∂(a*b)/∂a = b
+                out->prev[1]->grad += out->grad * out->prev[0]->val;  // ∂(a*b)/∂b = a
+            }
+        };
+        return out;
+    }
+    
+    // 反向传播
+    void backward() {
+        // 拓扑排序（简化版DFS）
+        vector<Tensor*> topo;
+        unordered_set<Tensor*> visited;
+        
+        function<void(Tensor*)> build_topo = [&](Tensor* node) {
+            if (!node || visited.count(node)) return;
+            visited.insert(node);
+            for (auto prev_node : node->prev) {
+                build_topo(prev_node);
+            }
+            topo.push_back(node);
+        };
+        
+        build_topo(this);
+        reverse(topo.begin(), topo.end());
+        
+        // 设置输出梯度为1（如果是损失）
+        this->grad = 1.0f;
+        
+        // 按拓扑顺序反向传播
+        for (auto node : topo) {
+            if (node->backward_func) {
+                node->backward_func();
+            }
+        }
+    }
+    
+    // 获取值和梯度
+    float value() const { return val; }
+    float gradient() const { return grad; }
+    
+    ~Tensor() {
+        // 实际实现中需要更复杂的内存管理
+        // 例如引用计数或智能指针
+    }
+};
 
 int main(){
     Tensor* a = new Tensor(1, 1);
