@@ -407,3 +407,37 @@ print(User.schema_json(indent=2))
 # 输出标准的 JSON Schema，可供API文档使用
 ```
 
+## typing
+
+typing是 Python 的类型提示标准库，用于为代码添加类型注解，提高代码的可读性和可维护性，并支持静态类型检查。
+
+```python
+from typing import List, Dict, Tuple, Optional
+
+# List-列表
+names: List[str] = ["Alice", "Bob"]
+scores: List[int] = [1, 2, 3]
+
+# Dict
+student: Dict[str, any] = {"name": "Alice", "age": 20, "scores": [95, 87]}
+config: Dict[str, int] = {"timeout": 30, "max_retires": 3}
+    
+# Tuple
+point: Tuple[float, float] = (1.5, 2.5)
+coords: Tuple[int, ... = (1, 2, 3, 4)
+mixed: Tuple[str, int, bool] = ("Alice", 20, True)
+```
+
+```python
+from typing import Union
+# 让一个变量/参数有多种类型选择，但必须是明确指定的类型之一
+def get_item(id: Union[int, str]) -> Item:
+    # id要么是int，要么是str
+    if isinstance(id, int):
+        # 处理数字id
+    else:
+        # 处理字符串id
+        
+Optinal[X] 就是 Union[X, None]
+```
+
