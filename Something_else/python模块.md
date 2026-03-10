@@ -385,6 +385,17 @@ class AsyncDatabaseConnections:
     async def 
 ```
 
+### 特殊方法
+
+py特殊方法以双下划线开头和结尾的方法，可以实现特定的行为。
+
+```python
+__enter__(self)          # 进入with块时调用
+__exit__(self, exc_type, exc_val, exc_tb)  # 离开with块时调用
+```
+
+
+
 ## Pydantic
 
 **Pydantic** 是一个 Python 数据验证和设置管理库，**用类型注解来验证数据**。
