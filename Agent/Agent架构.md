@@ -21,3 +21,4 @@
 ## Multi-Agent Pattern — Collaboration Through Specialization
 
 多agent模式[**Multi-Agent Pattern** — Collaboration Through Specialization](https://medium.com/@Deep-concept/top-ai-agentic-workflow-patterns-that-will-lead-in-2026-0e4755fdc6f6#2a38)
+
