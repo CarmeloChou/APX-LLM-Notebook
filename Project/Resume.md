@@ -23,3 +23,7 @@
 
 - 项目背景：既有服务对象为政府，具有较强的政策导向性，传统政策检索耗时耗力，通过agent代理检索、记忆、总结，可快速判断区域项目潜力，辅助项目决策。
 - 技术细节：上下文记忆、并行Agent架构、A2A……（可参考deepresearch）
+
+https://levelup.gitconnected.com/full-stack-contextual-engineering-for-ai-agents-435ae0169b68
+
+https://levelup.gitconnected.com/optimizing-langchain-ai-agents-with-contextual-engineering-0914d84601f3
