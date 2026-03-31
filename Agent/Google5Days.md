@@ -70,7 +70,7 @@ print("✅ root_agent created.")
 
 ![](./Image/sequential-agent.png)
 
-```py
+```python
 # Outline Agent: Creates the initial blog post outline.
 outline_agent = Agent(
     name="OutlineAgent",
@@ -230,7 +230,7 @@ print("✅ aggregator_agent created.")
 1. **Writer Agent** - Writes a draft of a short story
 2. **Critic Agent** - Reviews and critiques the short story to suggest improvements
 
-```py
+```python
 # This agent runs ONCE at the beginning to create the first draft.
 initial_writer_agent = Agent(
     name="InitialWriterAgent",
@@ -246,7 +246,7 @@ initial_writer_agent = Agent(
 print("✅ initial_writer_agent created.")
 ```
 
-```py
+```python
 # This agent's only job is to provide feedback or the approval signal. It has no tools.
 critic_agent = Agent(
     name="CriticAgent",
@@ -266,7 +266,7 @@ critic_agent = Agent(
 print("✅ critic_agent created.")
 ```
 
-```py
+```python
 # This is the function that the RefinerAgent will call to exit the loop.
 def exit_loop():
     """Call this function ONLY when the critique is 'APPROVED', indicating the story is finished and no more changes are needed."""
@@ -276,7 +276,7 @@ def exit_loop():
 print("✅ exit_loop function created.")
 ```
 
-```py
+```python
 # This agent refines the story based on critique OR calls the exit_loop function.
 refiner_agent = Agent(
     name="RefinerAgent",
@@ -301,7 +301,7 @@ refiner_agent = Agent(
 print("✅ refiner_agent created.")
 ```
 
-```py
+```python
 # The LoopAgent contains the agents that will run repeatedly: Critic -> Refiner.
 story_refinement_loop = LoopAgent(
     name="StoryRefinementLoop",
@@ -318,7 +318,7 @@ root_agent = SequentialAgent(
 print("✅ Loop and Sequential Agents created.")
 ```
 
-```py
+```python
 runner = InMemoryRunner(agent=root_agent)
 response = await runner.run_debug(
     "Write a short story about a lighthouse keeper who discovers a mysterious, glowing map"
