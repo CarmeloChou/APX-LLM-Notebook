@@ -391,6 +391,11 @@ py特殊方法以双下划线开头和结尾的方法，可以实现特定的行
 
 ```python
 __enter__(self)          # 进入with块时调用
+# 这里退出必须包含四个参数
+- self: 实例本身。
+- exc_type: 异常类型（如果没有异常，则为 None）。
+- exc_val: 异常值（如果没有异常，则为 None）。
+- exc_tb: 异常的 traceback 对象（如果没有异常，则为 None）。
 __exit__(self, exc_type, exc_val, exc_tb)  # 离开with块时调用
 ```
 
