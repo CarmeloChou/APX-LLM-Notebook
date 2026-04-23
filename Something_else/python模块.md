@@ -457,3 +457,30 @@ def get_item(id: Union[int, str]) -> Item:
 Optinal[X] 就是 Union[X, None]
 ```
 
+## subprocess
+
+Python 的一个**标准库**，无需安装，直接导入即可使用。可管理子进程，**并控制它们的输入、输出和错误流**。
+
+```python
+import subprocess
+
+result = subprocess.run(
+['dir'],
+shell=True,
+capture_output=True,
+encoding='gbk'
+)
+
+result.check_returncode()
+print(result)
+```
+
+使用Popen创建子进程可以替代run方法
+
+```python
+proc = subprocess.Popen(['timeout', '1'])
+while proc.poll() is None:
+    print('Working...')
+    print('Exit status', proc.poll())
+```
+
