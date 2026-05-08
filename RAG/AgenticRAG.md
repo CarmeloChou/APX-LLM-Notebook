@@ -145,7 +145,7 @@ SECRET_KEY=change_this_to_a_secure_random_string_for_jwt
 
 ```
 
-第一步定义基础的应用设置，比如环境、log等级、[JWT认证密钥](./JWT.md)
+第一步定义基础的应用设置，比如环境、log等级、[JWT认证密钥](./Knowledge_Added/JWT.md)
 
 ```bash
 # --- DATABASE (Aurora Postgres) ---
@@ -199,7 +199,6 @@ OTEL_EXPORTER_OTLP_ENDPOINT=http://locahost:4317
 
 ```makefile
 # Makefile
-
 .PHONY: help install dev up down deploy test
 help:
  @echo "RAG Platform Commands:"
@@ -413,7 +412,7 @@ def exponential_backoff(max_retries: int = 3, base_delay: float = 1.0, max_delay
 
 
 
-我们使用公式`base * (2 ^ retries) + random_jitter`来计算每次重试前的延迟。这有助于我们避免**“群殴”** **问题，**即多个客户端同时重试的情况。
+我们使用公式`base * (2 ^ retries) + random_jitter`来计算每次重试的延迟。这有助于我们避免**“群殴”** **问题，**即多个客户端同时重试的情况。
 
 ## 数据摄取层
 
@@ -449,8 +448,9 @@ chunking:
 	separators: [ "\n\n", "\n", " ", ""]
 	
 embedding:
-	# 要使用的Ray Serve 端点 endpoint
-	: "http://ray-serve-embed:8000/embed"
+	# 要使用的Ray Serve 端点
+    endpoint
+: "http://ray-serve-embed:8000/embed"
 	batch_size: 100
 	
 graph:
