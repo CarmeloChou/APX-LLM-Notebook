@@ -449,8 +449,7 @@ chunking:
 	
 embedding:
 	# 要使用的Ray Serve 端点
-    endpoint
-: "http://ray-serve-embed:8000/embed"
+    endpoint: "http://ray-serve-embed:8000/embed"
 	batch_size: 100
 	
 graph:
@@ -620,7 +619,7 @@ class GraphSchema:
         return f"提取节点/边。允许得标签:{VALID_NODE_LABELS.__args__}..."
 ```
 
-我们在 中应用此模式`pipelines/ingestion/graph/extractor.py`。它使用 LLM 来理解文本的*结构，而不仅仅是语义相似性。*
+我们在 中应用此模式`pipelines/ingestion/graph/extractor.py`。它使用 LLM 来理解文本的结构，而不仅仅是语义相似性。
 
 ```python
 # pipelines/ingestion/graph/extractor.py
@@ -1273,25 +1272,25 @@ class JSONFormatter(logging.Formatter):
         
         return json.dumps(log_record)
     
-    def setup_logging():
-        """
-        配置根日志记录输出JSON格式到标准输出
-        """
-        handler = logging.StreamHandler(sys.stdout)
-        handler.setFormatter(JSONFormatter())
+def setup_logging():
+    """
+    配置根日志记录输出JSON格式到标准输出
+    """
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(JSONFormatter())
+
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
         
-        root_logger = logging.getLogger()
-        root_logger.setLevel(logging.INFO)
+    # 移除默认处理程序以避免重复日志
+    if root_logger.handlers:
+       root_logger.handlers = []
+
+    root_logger.addHandler(handler)
         
-        # 移除默认处理程序以避免重复日志
-        if root_logger.handlers:
-            root_logger.handlers = []
-        
-        root_logger.addHandler(handler)
-        
-        # 静默部分杂乱的库
-        logging.getLogger("uvicorn.access").disabled = True
-        logging.getLogger("httpx").setLevel(logging.WARNING)
+    # 静默部分杂乱的库
+    logging.getLogger("uvicorn.access").disabled = True
+    logging.getLogger("httpx").setLevel(logging.WARNING)
         
 # 导入时初始化
 setup_logging()
@@ -1347,7 +1346,7 @@ async def get_current_user(token: str = Depends(oauth2_scheme)) -> dict:
         # 使用配置中定义的密钥验证签名
         payload = jwt.decode(
         	token,
-            settins.JWT_SECRET_KEY,
+            settings.JWT_SECRET_KEY,
             algorithms=[settings.JWT_ALGORITHM]
         )
         
