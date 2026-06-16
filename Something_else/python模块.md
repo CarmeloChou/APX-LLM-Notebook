@@ -283,6 +283,34 @@ for handler in root_logger.handlers[:]:  # 使用[:]创建副本
     handler.close()  # 重要：释放资源
 ```
 
+```python
+# 自定义输出格式，其实就是重写方法
+import logging
+import json
+
+class JsonFormatter(logging.Formatter):
+    def format(self, record):
+        log_dict = {
+            "time": self.formatTime(record),
+            "level": record.levelname,
+            "name": record.name,
+            "msg": record.getMessage()
+        }
+        return json.dumps(log_dict, ensure_ascii=False)
+    
+logger = logging.getLogger("MyAgent")
+logger.setLevel(logging.INFO)
+handler = logging.StreamHandler()
+handler.setFormatter(JsonFormatter())
+logger.addHandler(handler)
+
+logger.info("测试信息")
+# 清除所有handler
+logger.handlers.clear()
+```
+
+
+
 ## `__name__`模块
 
 ```python
@@ -482,5 +510,114 @@ proc = subprocess.Popen(['timeout', '1'])
 while proc.poll() is None:
     print('Working...')
     print('Exit status', proc.poll())
+```
+
+## Yield
+
+它的作用是把一个普通的函数变成**生成器（Generator）**，让函数具备了“暂停”和“记忆”的能力。
+
+- **`return`（普通函数）**：就像一个只会把结果一次性打包扔给你的快递员。函数一旦遇到 `return`，就会立刻结束并销毁所有内部状态。
+- **`yield`（生成器函数）**：就像一个可以多次互动的自动售货机。每次遇到 `yield`，它会吐出一个值并**暂停**，同时**记住**当前的所有状态（比如变量是多少、执行到哪一行了）。等你下次再要数据时，它会从上次暂停的地方继续往下执行。
+
+```python
+def number_generator(n):
+    for i in range(n):
+        print(f"准备产出数字: {i}")
+        yield i  # 产出 i，然后暂停在这里，等待下一次调用
+
+# 调用函数时，代码其实并没有立刻执行，而是返回了一个生成器对象
+gen = number_generator(3) 
+
+# 每次调用 next() 或使用 for 循环，才会真正触发一次执行
+print(next(gen))  # 输出: 准备产出数字: 0  换行 0
+print(next(gen))  # 输出: 准备产出数字: 1  换行 1
+print(next(gen))  # 输出: 准备产出数字: 2  换行 2
+```
+
+```python
+def echo():
+    while True:
+        # 暂停并等待外部传入值，传入的值会被赋值给 received
+        received = yield 
+        print(f"我收到了: {received}")
+
+g = echo()
+next(g)           # 必须先启动生成器，让它运行到第一个 yield 处暂停
+g.send("你好")    # 输出: 我收到了: 你好 （同时继续循环到下一个 yield 暂停）
+g.send("Python")  # 输出: 我收到了: Python
+```
+
+
+
+## 设计模式
+
+### 单例模式
+
+这里cls指类本身，这时self还没创建出来，必须使用new创建，new类似于cpp中的构造函数。init单纯负责初始化，创建之后，才能进行初始化赋值。
+
+```python
+class ThreadSafeSingleton:
+    """线程安全的单例模式"""
+    _instance = None
+    _lock = threading.Lock()
+    
+    def __new__(cls):
+        if cls._instance is None:
+            with cls._lock:
+                # 双重检查锁定
+                if cls._instance is None:
+                    cls._instance = super().__new__(cls)
+                    print("创建线程安全的单例实例")
+        return cls._instance
+    
+    def __init__(self):
+        # 确保只初始化一次
+        if not hasattr(self, '_initialized'):
+            self.data = {}
+            self._initialized = True
+```
+
+简单的单例：
+
+```python
+class ThreadSingle:
+    def __init__(self):
+        self.connection_string = "database://localhost:5432/mydb"
+        print("数据库连接已创建")
+               
+    def query(self, sql):
+        return f"执行查询: {sql}"
+            
+```
+
+使用new：当类未被创建时，创建类并初始化，第二次依然会被初始化，所以会显示第二个实例。这里可以加一个判断，来保证名称不会被改写。
+
+```python
+class TreadSingle:
+    _instance = None
+    
+    def __new__(cls, *args, **kwargs):
+        if not cls._instance:
+            cls._instance = super().__new__(cls)
+            print("创建新的单例实例")
+        else:
+            print("返回已存在的单例实例")
+        return cls._instance
+    
+    def __init__(self, name):
+        # 注意：__init__ 每次都会被调用
+        self.name = name
+        print(f"初始化实例，名称: {name}")
+        
+# 测试代码
+print("=== 测试单例模式 ===")
+s1 = Singleton("第一个实例")
+s2 = Singleton("第二个实例")
+
+print(f"s1 的 ID: {id(s1)}")
+print(f"s2 的 ID: {id(s2)}")
+print(f"s1 和 s2 是同一个对象吗？ {s1 is s2}")
+print(f"s1 名称: {s1.name}")
+print(f"s2 名称: {s2.name}")  # 注意：这里会显示"第二个实例"
 ```
 
