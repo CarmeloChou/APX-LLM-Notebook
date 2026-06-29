@@ -90,3 +90,7 @@ git checkout <commit> -- <file>
 # 4. 查看历史版本
 git checkout <commit>
 ```
+
+## git commit
+
+git commit --amend -m 修改最后一次的提交
