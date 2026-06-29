@@ -547,6 +547,25 @@ g.send("你好")    # 输出: 我收到了: 你好 （同时继续循环到下�
 g.send("Python")  # 输出: 我收到了: Python
 ```
 
+## Path
+
+```python
+import sys
+from pathlib import Path
+
+sys.path.append(str(Path(__file__).parent / "src"))
+```
+
+等价于告诉 Python：
+
+> “如果你找不到模块，也去这个目录找。”
+
+将当前文件所在目录的src文件夹加入Python模块搜索路径。可以直接实现：
+
+```python
+import something # 来自 src/somthing,.py
+```
+
 
 
 ## 设计模式
