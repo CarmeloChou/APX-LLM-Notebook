@@ -309,7 +309,16 @@ logger.info("测试信息")
 logger.handlers.clear()
 ```
 
+### basicConfig()和getLogger()区别
 
+|                  | **`basicConfig()`**                   | **`getLogger()`**              |
+| :--------------- | :------------------------------------ | :----------------------------- |
+| **干什么的**     | 给 **root logger** 做一次性初始化配置 | 获取（或创建）一个 logger 对象 |
+| **能不能打日志** | ❌ 不能，它只是"装修工人"              | ✅ 能，`logger.info("xxx")`     |
+| **能调几次**     | 只有**第一次**生效，后面调都是摆设    | 随时调，随时拿                 |
+| **本质**         | 配置函数                              | 工厂函数                       |
+
+即basicConfig是对 root logger做配置，一次配置后永久生效，再调用getlogger能生效是应为配置了root logger
 
 ## `__name__`模块
 
