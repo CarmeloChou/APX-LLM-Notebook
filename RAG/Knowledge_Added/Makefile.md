@@ -67,7 +67,7 @@ del2:                        # 第9行
 
 一般来说，并不需要用`.PHONY`标识`clean`等约定俗成的伪目标名称，除非有人故意搞破坏，手动创建名字叫`clean`的文件。
 
-命令加上@让程序不要打印该指令，比如`del`指令执行时，只会输出`has deleted test.txt`而`del2`指令执行时，会输出`rm -f test2.txt` 、 `echo "has deleted test2.txt"` 、`has deleted test2.txt`。
+命令加上@让程序不要打印该指令，比如`del`指令执行时，只会输出`has deleted test.txt`，如果不加@，比如`del2`指令执行时，会输出`rm -f test2.txt` 、 `echo "has deleted test2.txt"` 、`has deleted test2.txt`。
 
 如果删除文件时文件已经不再。如果想忽略错误，继续执行后续命令，可以在需要忽略错误的命令前加上`-`，或者在删除后加上`-f`：
 
