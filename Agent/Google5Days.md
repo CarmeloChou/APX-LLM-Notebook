@@ -1561,7 +1561,7 @@ retry_config = types.HttpRetryOptions(
 
 - 通过A2A（应用程序到应用程序）接口公开，任何经过授权的智能体都能采用标准协议调用该服务
 
-```py
+```python
 # Define a product catalog lookup tool
 # In a real system, this would query the vendor's product database
 def get_product_info(product_name: str) -> str:
@@ -1656,7 +1656,7 @@ to_a2a()的作用：
 - [Exposing Agents with ADK](https://google.github.io/adk-docs/a2a/quickstart-exposing/)
 - [A2A Protocol Specification](https://a2a-protocol.org/latest/specification/)
 
-```py
+```python
 # Convert the product catalog agent to an A2A-compatible application
 # This creates a FastAPI/Starlette app that:
 #   1. Serves the agent at the A2A protocol endpoints
@@ -1683,7 +1683,7 @@ print("   Ready to start the server...")
 
 - 在生产环境中，供应商会在其基础设施上托管此服务
 
-```py
+```python
 # First, let's save the product catalog agent to a file that uvicorn can import
 product_catalog_agent_code = '''
 import os
@@ -1791,7 +1791,7 @@ globals()["product_catalog_server_process"] = server_process
 
 The `to_a2a()` function automatically created an **agent card** that describes the Product Catalog Agent's capabilities. Let's take a look!
 
-```py
+```python
 # Fetch the agent card from the running server
 try:
     response = requests.get(
@@ -1843,7 +1843,7 @@ RemoteA2aAgent的工作原理：
 - [Consuming Remote Agents with ADK](https://google.github.io/adk-docs/a2a/quickstart-consuming/)
 - [What is A2A?](https://a2a-protocol.org/latest/topics/what-is-a2a/)
 
-```py
+```python
 # Create a RemoteA2aAgent that connects to our Product Catalog Agent
 # This acts as a client-side proxy - the Customer Support Agent can use it like a local agent
 remote_product_catalog_agent = RemoteA2aAgent(
@@ -1859,7 +1859,7 @@ print(f"   Agent card: http://localhost:8001{AGENT_CARD_WELL_KNOWN_PATH}")
 print("   The Customer Support Agent can now use this like a local sub-agent!")
 ```
 
-```py
+```python
 # Now create the Customer Support Agent that uses the remote Product Catalog Agent
 customer_support_agent = LlmAgent(
     model=Gemini(model="gemini-2.5-flash-lite", retry_options=retry_config),
@@ -1887,7 +1887,7 @@ print("   Ready to help customers!")
 
 ### 测试A2A对话
 
-```py
+```python
 async def test_a2a_communication(user_query: str):
     """
     Test the A2A communication between Customer Support Agent and Product Catalog Agent.
