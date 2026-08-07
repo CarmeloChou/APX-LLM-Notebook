@@ -662,7 +662,7 @@ class GraphExtractor:
                         "max_tokens" : 1024
                     }
                 )
-                reponse.raise_for_status()
+                response.raise_for_status()
                 
                 # 3.解析JSON输出
                 # 我们假设模型返回有效的JSON（通过约束解码或后处理保证）
