@@ -54,6 +54,15 @@ Anthropic在他们的研究中（ [in their research](https://www.anthropic.com/
 
 ![](./Image/ContextualEngineering.png)
 
-## 从零开始LangGraph
+## 使用LangGraph记录
 
 就像人类记忆最近的工作记笔记一样，agents可以做同样的事情，通过使用`scratchpad`[https://www.anthropic.com/engineering/claude-think-tool]。它存储了上下文窗口外的信息，因此agent可以在任何需要的时候访问它。
+
+一个好的例子是[Anthropic multi-agent researcher](https://www.anthropic.com/engineering/built-multi-agent-research-system):
+
+> LeadResearcher计划相关方法并且保存记忆，因为上下文窗口超过20wtoken时，它会进行阶段，因此需要保存相关计划确保它不会丢失
+
+Scratchpad可以以不同方式运用：
+
+- 作为写入文件的工具调用
+- 作为运行状态对象的一个字段，在会话期间留存
