@@ -575,6 +575,30 @@ sys.path.append(str(Path(__file__).parent / "src"))
 import something # 来自 src/somthing,.py
 ```
 
+## python 类导入
+
+python类是别的模块的依赖项时，需要在类模块加入__all__ = ['类名']，以便于工程实践
+
+```python
+__all__ = ["WeismSolver", "WeismConfig"]  # ✅ 显式声明公共API
+
+class WeismSolver:
+    """公共类，供外部使用"""
+    pass
+
+class WeismConfig:
+    """公共配置类"""
+    pass
+
+class _InternalCache:
+    """内部实现，不应被外部直接使用"""
+    pass
+
+def _helper_func():
+    """内部辅助函数"""
+    pass
+```
+
 
 
 ## 设计模式
